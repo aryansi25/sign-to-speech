@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.log
+*.npz
+dataset/
+*.keras
+labels.npy
+old_*.py
+old_*.html
+audio_cache/
+.DS_Store
+Thumbs.db

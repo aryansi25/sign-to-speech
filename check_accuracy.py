@@ -1,11 +1,22 @@
 import os
+import sys
 import numpy as np
 import tensorflow as tf
+
+DATASET_PATH = "dataset"
+
+if not os.path.exists(DATASET_PATH):
+    print(f"Error: Dataset directory '{DATASET_PATH}' was not found.")
+    print("Please place dataset directory in the project root to evaluate accuracy.")
+    sys.exit(1)
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from tensorflow.keras.utils import to_categorical
 
-DATASET_PATH = "dataset"
+def sort_key(name):
+    base = os.path.splitext(name)[0]
+    return int(base) if base.isdigit() else name
 
 sequences = []
 labels = []
@@ -19,24 +30,31 @@ for idx, action in enumerate(actions):
 # Load dataset
 for action in actions:
     action_path = os.path.join(DATASET_PATH, action)
+    if not os.path.isdir(action_path):
+        continue
 
-    for sequence in os.listdir(action_path):
+    for sequence in sorted(os.listdir(action_path), key=sort_key):
         seq_path = os.path.join(action_path, sequence)
+        if not os.path.isdir(seq_path):
+            continue
 
         frames = []
-        for frame in sorted(os.listdir(seq_path)):
+        for frame in sorted(os.listdir(seq_path), key=sort_key):
             frame_path = os.path.join(seq_path, frame)
-
-            data = np.load(frame_path)
-
-            if data.shape[0] == 126:
-                frames.append(data)
+            if frame.endswith(".npy"):
+                data = np.load(frame_path)
+                if data.shape[0] == 126:
+                    frames.append(data)
 
         if len(frames) == 20:
             sequences.append(frames)
             labels.append(label_map[action])
 
-X = np.array(sequences)
+if len(sequences) == 0:
+    print("Error: No 20-frame sequences found in dataset.")
+    sys.exit(1)
+
+X = np.array(sequences, dtype=np.float32)
 y = to_categorical(labels)
 
 # Train/Test Split (same as training)
