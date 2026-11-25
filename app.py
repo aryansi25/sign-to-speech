@@ -90,15 +90,17 @@ state_lock = threading.Lock()
 seq_lock = threading.Lock()
 
 sequence = deque(maxlen=20)
-prediction_history = deque(maxlen=3)   # Low inertia rolling window (zero delay)
-prediction_queue = deque(maxlen=3)     # Immediate majority voting
+prediction_history = deque(maxlen=5)   # Exponential-weighted 5-frame rolling window
+prediction_queue = deque(maxlen=3)
 
 last_sign_commit_time = 0.0
 missing_hand_frames = 0
 
-latest_sequence_snapshot = None
-latest_hand_lms_snapshot = None
-latest_face_info_snapshot = None
+latest_sequence_snapshot   = None
+latest_hand_lms_snapshot   = None
+latest_face_info_snapshot  = None
+latest_hand_velocity_snapshot = 0.0   # wrist speed (screen-units/frame)
+wrist_history = deque(maxlen=6)        # recent wrist positions for velocity estimate
 new_sample_ready = threading.Event()
 worker_running = True
 
@@ -147,153 +149,185 @@ face_detector = mp_face.FaceDetection(
 LABEL_TO_IDX = {str(lbl): i for i, lbl in enumerate(labels)}
 
 # =========================
-# DISAMBIGUATION ENGINE (HAND GEOMETRY & FACIAL ZONES)
+# DISAMBIGUATION ENGINE (HAND GEOMETRY + VELOCITY + FACIAL ZONES)
 # =========================
 
-def disambiguate_prediction(preds, hand_lms_list, face_info=None):
+def joint_angle(a, b, c):
     """
-    Combines hand pose geometry (finger extension, bunched fingertips, 'W' pose,
-    'ILY' pose, closed fist, pointing) with facial zones (mouth, chin, temple, chest)
-    to deterministically disambiguate visually overlapping gestures:
-    - FOOD vs THANK_YOU (bunched fingertips at mouth vs flat open palm moving from chin)
-    - I vs YES (pointing index finger at chest vs closed fist)
-    - WATER ('W' sign near mouth)
-    - UNDERSTAND vs HELLO (index pointing to temple vs open waving hand)
-    - I_LOVE_YOU ('ILY' sign)
-    - OKAY vs INDIAN (circle with thumb and index)
-    - MY vs I (flat palm on chest vs pointing at chest)
+    Returns the interior angle (degrees) at joint b in the chain a->b->c.
+    Uses raw (x, y) screen coordinates. 180 = fully extended, 0 = fully folded.
+    Scale-invariant: works at any hand distance from the camera.
+    """
+    v1 = np.array(a[:2]) - np.array(b[:2])
+    v2 = np.array(c[:2]) - np.array(b[:2])
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 < 1e-7 or n2 < 1e-7:
+        return 180.0
+    return float(np.degrees(np.arccos(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))))
+
+
+def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
+    """
+    Precision disambiguation pipeline combining:
+      1. Joint-angle-based finger state detection (scale-invariant, camera-distance-invariant)
+      2. Wrist velocity — static vs dynamic hand motion separates overlapping signs
+      3. Facial zone estimation (temple / mouth / chest) using face detector + absolute fallback
+      4. Two-hand presence detection for WHAT / WHERE / NICE
     """
     if not hand_lms_list or len(hand_lms_list) == 0:
         return preds
 
     p = np.copy(preds)
-    primary_hand = hand_lms_list[0]
-    if len(primary_hand) < 21:
+    primary = hand_lms_list[0]
+    if len(primary) < 21:
         return preds
 
+    # Angle-based finger state (MCP -> PIP -> TIP)
+    def ja(a, b, c):
+        return joint_angle(primary[a], primary[b], primary[c])
+
+    ang_idx   = ja(5, 6, 8)
+    ang_mid   = ja(9, 10, 12)
+    ang_ring  = ja(13, 14, 16)
+    ang_pinky = ja(17, 18, 20)
+    ang_thumb = ja(1, 2, 4)
+
+    EXT  = 148   # >= 148 deg -> extended
+    CURL = 115   # <= 115 deg -> curled
+
+    ext_idx   = ang_idx   >= EXT
+    ext_mid   = ang_mid   >= EXT
+    ext_ring  = ang_ring  >= EXT
+    ext_pinky = ang_pinky >= EXT
+    ext_thumb = ang_thumb >= 128
+
+    curl_idx   = ang_idx   <= CURL
+    curl_mid   = ang_mid   <= CURL
+    curl_ring  = ang_ring  <= CURL
+    curl_pinky = ang_pinky <= CURL
+
+    num_ext  = sum([ext_idx, ext_mid, ext_ring, ext_pinky])
+    num_curl = sum([curl_idx, curl_mid, curl_ring, curl_pinky])
+
     def dist(i, j):
-        return np.linalg.norm(np.array(primary_hand[i][:2]) - np.array(primary_hand[j][:2]))
+        return np.linalg.norm(np.array(primary[i][:2]) - np.array(primary[j][:2]))
 
-    # Finger extension metrics relative to wrist (point 0)
-    # Using Euclidean distance ratio: tip vs pip
-    ext_idx = dist(0, 8) > dist(0, 6) * 1.12
-    ext_mid = dist(0, 12) > dist(0, 10) * 1.12
-    ext_ring = dist(0, 16) > dist(0, 14) * 1.12
-    ext_pinky = dist(0, 20) > dist(0, 18) * 1.12
-    ext_thumb = dist(4, 17) > dist(3, 17) * 1.10
+    d_thumb_idx = dist(4, 8)
+    d_idx_mid   = dist(8, 12)
+    d_thumb_mid = dist(4, 12)
 
-    num_ext = sum([ext_idx, ext_mid, ext_ring, ext_pinky])
+    is_moving = velocity > 0.013
+    is_static = velocity < 0.007
+    two_hands = len(hand_lms_list) >= 2
 
-    # Curled fingers check relative to wrist
-    is_curled_idx = dist(0, 8) < dist(0, 6)
-    is_curled_mid = dist(0, 12) < dist(0, 10)
-    is_curled_ring = dist(0, 16) < dist(0, 14)
-    is_curled_pinky = dist(0, 20) < dist(0, 18)
+    # 1. CLOSED FIST (YES)
+    is_fist = curl_idx and curl_mid and curl_ring and curl_pinky
 
-    # 1. Closed fist (YES): index, middle and ring are curled into palm
-    is_fist = is_curled_idx and is_curled_mid and is_curled_ring
+    # 2. BUNCHED FINGERTIPS (FOOD)
+    tips_clustered = (d_thumb_idx < 0.09 and d_idx_mid < 0.08 and d_thumb_mid < 0.10)
+    is_bunched = (not is_fist) and tips_clustered and (num_ext >= 1 or num_curl <= 2)
 
-    # 2. Bunched fingertips (FOOD): fingertips gathered together reaching away from wrist towards mouth
-    bunch_dist_thumb_idx = dist(4, 8)
-    bunch_dist_idx_mid = dist(8, 12)
-    bunch_dist_thumb_mid = dist(4, 12)
-    is_bunched = (not is_fist) and (dist(0, 8) > dist(0, 6)) and (bunch_dist_thumb_idx < 0.080) and (bunch_dist_idx_mid < 0.065) and (bunch_dist_thumb_mid < 0.085)
+    # 3. 'W' POSE (WATER)
+    is_w_pose = (not is_fist) and (not is_bunched) and ext_idx and ext_mid and ext_ring and curl_pinky
 
-    # 3. 'W' pose (WATER): index, middle, ring extended; pinky curled
-    is_w_pose = (not is_fist) and (not is_bunched) and ext_idx and ext_mid and ext_ring and (not ext_pinky)
+    # 4. 'ILY' POSE (I_LOVE_YOU)
+    is_ily = (
+        (not is_fist) and (not is_bunched)
+        and ext_idx and ext_pinky and ext_thumb
+        and curl_mid and curl_ring
+    )
 
-    # 4. 'ILY' pose (I_LOVE_YOU): index, pinky, thumb extended; middle and ring curled
-    is_ily = (not is_fist) and (not is_bunched) and ext_idx and ext_pinky and ext_thumb and (not ext_mid) and (not ext_ring)
+    # 5. OK CIRCLE (OKAY / INDIAN)
+    is_ok_circle = (
+        (not is_fist) and (not is_bunched)
+        and d_thumb_idx < 0.055
+        and (ext_mid or ext_ring or ext_pinky)
+    )
 
-    # 5. 'OK' circle (OKAY / INDIAN): thumb tip touching index tip in circle, other fingers extended
-    is_ok_circle = (not is_fist) and (not is_bunched) and (bunch_dist_thumb_idx < 0.055) and (ext_mid or ext_ring or ext_pinky)
+    # 6. POINTING (I / UNDERSTAND / WHERE)
+    is_pointing = (
+        (not is_fist) and (not is_bunched) and (not is_w_pose)
+        and (not is_ok_circle) and (not is_ily)
+        and ext_idx and curl_mid and curl_ring and curl_pinky
+    )
 
-    # 6. Pointing (I / UNDERSTAND): index extended, other fingers curled
-    is_pointing = (not is_fist) and (not is_bunched) and (not is_w_pose) and (not is_ok_circle) and ext_idx and (not ext_mid) and (not ext_ring) and (not ext_pinky)
+    # 7. OPEN FLAT PALM (HELLO / MY / THANK_YOU / WANT / WELCOME)
+    is_open_palm = (
+        (not is_fist) and (not is_bunched) and (not is_w_pose)
+        and (not is_ok_circle) and (not is_pointing) and (not is_ily)
+        and num_ext >= 3 and d_thumb_idx > 0.065
+    )
 
-    # 7. Open flat palm (THANK_YOU / HELLO / MY): >= 3 fingers extended, spread
-    is_open_palm = (not is_fist) and (not is_bunched) and (not is_w_pose) and (not is_ok_circle) and (not is_pointing) and (num_ext >= 3) and (bunch_dist_thumb_idx > 0.075)
-
-    # Facial Zones
-    in_mouth_zone = False
-    in_temple_zone = False
-    in_chest_zone = False
+    # Facial / body zone estimation (using fingertip top hand_min_y for clean zone separation)
+    hand_min_y = min(pt[1] for pt in primary)
 
     if face_info is not None:
-        hand_min_y = min([pt[1] for pt in primary_hand])
-        mouth_y = face_info.get('mouth', (0.5, 0.5))[1]
-        chin_y = face_info.get('chin_y', 0.6)
-        nose_y = face_info.get('nose', (0.5, 0.4))[1]
-        face_h = face_info.get('bbox', (0, 0, 0, 0.2))[3]
+        chin_y = face_info.get('chin_y', 0.65)
+        nose_y = face_info.get('nose', (0.5, 0.40))[1]
+        face_h = face_info.get('bbox', (0, 0, 0, 0.22))[3]
+        in_temple_zone = hand_min_y <= (nose_y + face_h * 0.10)
+        in_chest_zone  = hand_min_y >  (chin_y + face_h * 0.05)
+    else:
+        in_temple_zone = hand_min_y < 0.26
+        in_chest_zone  = hand_min_y > 0.46
 
-        in_temple_zone = hand_min_y <= (nose_y + face_h * 0.1)
-        in_mouth_zone = (nose_y - face_h * 0.2) <= hand_min_y <= (chin_y + face_h * 0.35)
-        in_chest_zone = hand_min_y > (chin_y + face_h * 0.2)
+    def boost(key, factor=7.0, suppress=None):
+        if key not in LABEL_TO_IDX:
+            return
+        p[LABEL_TO_IDX[key]] = max(p[LABEL_TO_IDX[key]] * factor, 2.0)
+        for k in (suppress or []):
+            if k in LABEL_TO_IDX:
+                p[LABEL_TO_IDX[k]] *= 0.02
 
-    # MUTUALLY EXCLUSIVE DETERMINISTIC DISAMBIGUATION:
+    # Two-hand signs
+    if two_hands:
+        sec = hand_lms_list[1]
+        if len(sec) >= 21:
+            sec_ext_idx = joint_angle(sec[5], sec[6], sec[8]) >= EXT
+            sec_num_ext = sum([
+                joint_angle(sec[5], sec[6], sec[8])  >= EXT,
+                joint_angle(sec[9], sec[10], sec[12]) >= EXT,
+                joint_angle(sec[13], sec[14], sec[16]) >= EXT,
+                joint_angle(sec[17], sec[18], sec[20]) >= EXT,
+            ])
+            both_open = (num_ext >= 3) and (sec_num_ext >= 3)
+            if both_open and is_moving:
+                boost('WHAT', factor=7.0, suppress=['HELLO', 'WELCOME', 'WANT', 'WHERE'])
+            elif both_open and is_static:
+                boost('NICE', factor=5.0)
+            elif is_pointing and sec_ext_idx and not in_chest_zone:
+                boost('WHERE', factor=6.0, suppress=['UNDERSTAND', 'I', 'WHAT'])
+
+    # Mutually-exclusive single-hand disambiguation
     if is_bunched:
-        # Bunched fingertips (FOOD)
-        if 'FOOD' in LABEL_TO_IDX:
-            f_idx = LABEL_TO_IDX['FOOD']
-            p[f_idx] = max(p[f_idx] * 5.0, 1.5)
-            if 'THANK_YOU' in LABEL_TO_IDX: p[LABEL_TO_IDX['THANK_YOU']] *= 0.05
-            if 'YES' in LABEL_TO_IDX: p[LABEL_TO_IDX['YES']] *= 0.05
-            if 'I' in LABEL_TO_IDX: p[LABEL_TO_IDX['I']] *= 0.05
+        boost('FOOD', factor=9.0, suppress=['THANK_YOU', 'YES', 'I', 'MY', 'HELLO', 'WANT', 'WATER'])
     elif is_w_pose:
-        # 'W' sign (WATER)
-        if 'WATER' in LABEL_TO_IDX:
-            w_idx = LABEL_TO_IDX['WATER']
-            p[w_idx] = max(p[w_idx] * 5.0, 1.5)
-            if 'FOOD' in LABEL_TO_IDX: p[LABEL_TO_IDX['FOOD']] *= 0.05
-            if 'THANK_YOU' in LABEL_TO_IDX: p[LABEL_TO_IDX['THANK_YOU']] *= 0.05
-            if 'YES' in LABEL_TO_IDX: p[LABEL_TO_IDX['YES']] *= 0.05
+        boost('WATER', factor=9.0, suppress=['FOOD', 'THANK_YOU', 'YES', 'HELLO', 'WANT'])
     elif is_pointing:
-        # Extended index point: UNDERSTAND (temple) vs I (chest)
-        if in_temple_zone and 'UNDERSTAND' in LABEL_TO_IDX:
-            u_idx = LABEL_TO_IDX['UNDERSTAND']
-            p[u_idx] = max(p[u_idx] * 5.0, 1.5)
-            if 'HELLO' in LABEL_TO_IDX: p[LABEL_TO_IDX['HELLO']] *= 0.05
-            if 'I' in LABEL_TO_IDX: p[LABEL_TO_IDX['I']] *= 0.05
-            if 'YES' in LABEL_TO_IDX: p[LABEL_TO_IDX['YES']] *= 0.05
-        elif 'I' in LABEL_TO_IDX:
-            i_idx = LABEL_TO_IDX['I']
-            p[i_idx] = max(p[i_idx] * 5.0, 1.5)
-            if 'YES' in LABEL_TO_IDX: p[LABEL_TO_IDX['YES']] *= 0.05
-            if 'UNDERSTAND' in LABEL_TO_IDX: p[LABEL_TO_IDX['UNDERSTAND']] *= 0.05
+        if in_temple_zone:
+            boost('UNDERSTAND', factor=9.0, suppress=['HELLO', 'I', 'YES', 'MY', 'WHERE'])
+        else:
+            boost('I', factor=9.0, suppress=['YES', 'UNDERSTAND', 'MY', 'FOOD', 'WANT', 'WHERE'])
     elif is_fist:
-        # Closed fist (YES)
-        if 'YES' in LABEL_TO_IDX:
-            y_idx = LABEL_TO_IDX['YES']
-            p[y_idx] = max(p[y_idx] * 5.0, 1.5)
-            if 'I' in LABEL_TO_IDX: p[LABEL_TO_IDX['I']] *= 0.05
-            if 'FOOD' in LABEL_TO_IDX: p[LABEL_TO_IDX['FOOD']] *= 0.05
-            if 'THANK_YOU' in LABEL_TO_IDX: p[LABEL_TO_IDX['THANK_YOU']] *= 0.05
+        boost('YES', factor=9.0, suppress=['I', 'FOOD', 'THANK_YOU', 'MY', 'WANT', 'WHAT'])
     elif is_open_palm:
-        # Open flat palm: HELLO (temple) vs MY (chest) vs THANK_YOU (chin/mouth)
-        if in_temple_zone and 'HELLO' in LABEL_TO_IDX:
-            h_idx = LABEL_TO_IDX['HELLO']
-            p[h_idx] = max(p[h_idx] * 5.0, 1.5)
-            if 'UNDERSTAND' in LABEL_TO_IDX: p[LABEL_TO_IDX['UNDERSTAND']] *= 0.05
-        elif in_chest_zone and 'MY' in LABEL_TO_IDX and p[LABEL_TO_IDX['MY']] >= p[LABEL_TO_IDX.get('THANK_YOU', 0)]:
-            m_idx = LABEL_TO_IDX['MY']
-            p[m_idx] = max(p[m_idx] * 5.0, 1.5)
-            if 'I' in LABEL_TO_IDX: p[LABEL_TO_IDX['I']] *= 0.05
-        elif 'THANK_YOU' in LABEL_TO_IDX:
-            ty_idx = LABEL_TO_IDX['THANK_YOU']
-            p[ty_idx] = max(p[ty_idx] * 5.0, 1.5)
-            if 'FOOD' in LABEL_TO_IDX: p[LABEL_TO_IDX['FOOD']] *= 0.05
-    elif is_ily:
-        if 'I_LOVE_YOU' in LABEL_TO_IDX:
-            ily_idx = LABEL_TO_IDX['I_LOVE_YOU']
-            p[ily_idx] = max(p[ily_idx] * 5.0, 1.5)
-    elif is_ok_circle:
-        if 'OKAY' in LABEL_TO_IDX and 'INDIAN' in LABEL_TO_IDX:
-            ok_idx = LABEL_TO_IDX['OKAY']
-            ind_idx = LABEL_TO_IDX['INDIAN']
-            if p[ok_idx] >= p[ind_idx]:
-                p[ok_idx] = max(p[ok_idx] * 4.0, 1.5)
+        if in_temple_zone:
+            boost('HELLO', factor=9.0, suppress=['UNDERSTAND', 'MY', 'THANK_YOU', 'WANT', 'WHAT'])
+        elif in_chest_zone:
+            if is_moving:
+                boost('WANT', factor=8.0, suppress=['MY', 'THANK_YOU', 'I', 'HELLO', 'FOOD'])
             else:
-                p[ind_idx] = max(p[ind_idx] * 4.0, 1.5)
+                boost('MY', factor=9.0, suppress=['I', 'THANK_YOU', 'FOOD', 'HELLO', 'WANT'])
+        else:
+            boost('THANK_YOU', factor=8.0, suppress=['FOOD', 'MY', 'HELLO', 'WANT', 'YES'])
+    elif is_ily:
+        boost('I_LOVE_YOU', factor=9.0, suppress=['I', 'YES', 'HELLO', 'WHAT', 'WANT'])
+    elif is_ok_circle:
+        ok_i  = LABEL_TO_IDX.get('OKAY', -1)
+        ind_i = LABEL_TO_IDX.get('INDIAN', -1)
+        if ok_i >= 0 and ind_i >= 0:
+            winner = 'OKAY' if p[ok_i] >= p[ind_i] else 'INDIAN'
+            boost(winner, factor=6.0)
 
     # Normalize distribution
     s = np.sum(p)
@@ -405,21 +439,25 @@ def inference_worker():
             input_data = np.copy(latest_sequence_snapshot)
             hand_lms = latest_hand_lms_snapshot
             face_info = latest_face_info_snapshot
+            velocity = latest_hand_velocity_snapshot
 
         try:
             # Forward pass through trained LSTM
             preds = model(input_data, training=False).numpy()[0]
 
-            # Deterministic hand pose & facial zone disambiguation
-            preds = disambiguate_prediction(preds, hand_lms, face_info)
+            # Deterministic hand pose, velocity & facial zone disambiguation
+            preds = disambiguate_prediction(preds, hand_lms, face_info, velocity=velocity)
 
             with state_lock:
                 if not hands_in_frame:
                     continue
 
                 prediction_history.append(preds)
-                # Stage 1: Fast rolling distribution
-                avg_preds = np.mean(prediction_history, axis=0)
+                # Exponential-weighted rolling average (recent frames weighted higher)
+                hist_list = list(prediction_history)
+                weights = np.array([0.5 ** (len(hist_list) - 1 - i) for i in range(len(hist_list))], dtype=np.float32)
+                weights /= np.sum(weights)
+                avg_preds = np.average(hist_list, axis=0, weights=weights)
 
                 # Raw instantaneous prediction
                 raw_idx = int(np.argmax(preds))
@@ -588,9 +626,11 @@ def generate_frames():
                         sequence.clear()
                         prediction_history.clear()
                         prediction_queue.clear()
+                        wrist_history.clear()
                         latest_sequence_snapshot = None
                         latest_hand_lms_snapshot = None
                         latest_face_info_snapshot = None
+                        latest_hand_velocity_snapshot = 0.0
             else:
                 missing_hand_frames = 0
                 with state_lock:
@@ -603,6 +643,7 @@ def generate_frames():
                         # Instant pre-warm: fill 20-frame sequence buffer on frame 1 so inference begins immediately
                         if not was_hands or len(sequence) == 0:
                             sequence.extend([norm_vec] * 20)
+                            wrist_history.clear()
                         else:
                             sequence.append(norm_vec)
 
@@ -611,6 +652,18 @@ def generate_frames():
                             [(lm.x, lm.y, lm.z) for lm in lms.landmark]
                             for lms in valid_lms
                         ]
+                        # Track wrist velocity (screen-units/frame)
+                        w_pt = latest_hand_lms_snapshot[0][0][:2]
+                        wrist_history.append(w_pt)
+                        if len(wrist_history) >= 2:
+                            diffs = [
+                                np.linalg.norm(np.array(wrist_history[i]) - np.array(wrist_history[i - 1]))
+                                for i in range(1, len(wrist_history))
+                            ]
+                            latest_hand_velocity_snapshot = float(np.mean(diffs))
+                        else:
+                            latest_hand_velocity_snapshot = 0.0
+
                         latest_face_info_snapshot = face_info
                         new_sample_ready.set()
 
@@ -723,7 +776,8 @@ def set_sign_language():
 
 @app.route("/api/stop_camera", methods=["POST"])
 def stop_camera():
-    global cap, hold_counter, current_sign, last_added_sign, hands_in_frame, latest_sequence_snapshot
+    global cap, hold_counter, current_sign, last_added_sign, hands_in_frame
+    global latest_sequence_snapshot, latest_hand_lms_snapshot, latest_face_info_snapshot, latest_hand_velocity_snapshot
     with state_lock:
         hold_counter = 0
         current_sign = None
@@ -734,9 +788,11 @@ def stop_camera():
         sequence.clear()
         prediction_history.clear()
         prediction_queue.clear()
+        wrist_history.clear()
         latest_sequence_snapshot = None
         latest_hand_lms_snapshot = None
         latest_face_info_snapshot = None
+        latest_hand_velocity_snapshot = 0.0
 
     if cap is not None:
         try:
