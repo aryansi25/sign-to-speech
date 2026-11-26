@@ -124,26 +124,29 @@ translation_cache = {}
 audio_cache = {}  # In-memory RAM cache for 0ms conversational audio streaming
 
 # =========================
-# MEDIAPIPE (ULTRA-FAST REALTIME HAND & FACE TRACKING)
+# MEDIAPIPE (HIGH-ACCURACY REALTIME HAND & FACE TRACKING)
 # =========================
 
 mp_hands = mp.solutions.hands
 mp_face = mp.solutions.face_detection
 
-# model_complexity=0 is the ultra-fast real-time model optimized for fluid 30 FPS webcam tracking
+# model_complexity=1 gives much sharper finger-curl & bunched-hand landmark accuracy
 hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=2,
-    model_complexity=0,
-    min_detection_confidence=0.55,
-    min_tracking_confidence=0.55
+    model_complexity=1,
+    min_detection_confidence=0.45,
+    min_tracking_confidence=0.45
 )
 
-# Ultra-fast real-time face detector (< 4ms on CPU) for facial zone localization (mouth, chin, temple)
+# model_selection=1 (full-range 0-5m) detects faces reliably at any webcam distance
 face_detector = mp_face.FaceDetection(
-    model_selection=0,
-    min_detection_confidence=0.50
+    model_selection=1,
+    min_detection_confidence=0.40
 )
+
+# CLAHE contrast normalizer for MediaPipe input (improves palm/face detection in dim/backlit rooms)
+_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 # Label lookup table for rapid disambiguation
 LABEL_TO_IDX = {str(lbl): i for i, lbl in enumerate(labels)}
@@ -271,6 +274,22 @@ def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
         in_temple_zone = hand_min_y < 0.26
         in_chest_zone  = hand_min_y > 0.46
 
+    top_idx = int(np.argmax(p))
+    top_label = str(labels[top_idx])
+    top_conf = float(p[top_idx])
+
+    def should_disambiguate(group_keys):
+        """
+        Only disambiguate when the LSTM's top prediction is inside this confusion group,
+        OR when the LSTM is uncertain (top_conf < 0.55) and a group member is plausible (>= 0.08).
+        Prevents hijacking confident predictions for unrelated signs (PLEASE, SORRY, HELP, YOU, etc.).
+        """
+        if top_label in group_keys:
+            return True
+        if top_conf < 0.55:
+            return any(p[LABEL_TO_IDX[k]] >= 0.08 for k in group_keys if k in LABEL_TO_IDX)
+        return False
+
     def boost(key, factor=7.0, suppress=None):
         if key not in LABEL_TO_IDX:
             return
@@ -279,55 +298,161 @@ def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
             if k in LABEL_TO_IDX:
                 p[LABEL_TO_IDX[k]] *= 0.02
 
-    # Two-hand signs
+    # Helper for any hand's finger states
+    def _hand_stats(h):
+        def h_ja(a, b, c):
+            return joint_angle(h[a], h[b], h[c])
+        def h_dist(i, j):
+            return np.linalg.norm(np.array(h[i][:2]) - np.array(h[j][:2]))
+        e_idx   = h_ja(5, 6, 8)   >= EXT
+        e_mid   = h_ja(9, 10, 12) >= EXT
+        e_ring  = h_ja(13, 14, 16) >= EXT
+        e_pinky = h_ja(17, 18, 20) >= EXT
+        e_thumb = h_ja(1, 2, 4)   >= 128
+        c_idx   = h_ja(5, 6, 8)   <= CURL
+        c_mid   = h_ja(9, 10, 12) <= CURL
+        c_ring  = h_ja(13, 14, 16) <= CURL
+        c_pinky = h_ja(17, 18, 20) <= CURL
+        n_ext   = sum([e_idx, e_mid, e_ring, e_pinky])
+        n_curl  = sum([c_idx, c_mid, c_ring, c_pinky])
+        return {
+            "e_idx": e_idx, "e_mid": e_mid, "e_ring": e_ring, "e_pinky": e_pinky, "e_thumb": e_thumb,
+            "c_idx": c_idx, "c_mid": c_mid, "c_ring": c_ring, "c_pinky": c_pinky,
+            "n_ext": n_ext, "n_curl": n_curl,
+            "is_fist": c_idx and c_mid and c_ring and c_pinky,
+            "is_point": e_idx and c_mid and c_ring and c_pinky,
+            "is_two": e_idx and e_mid and c_ring and c_pinky,
+            "is_open": n_ext >= 3 and h_dist(4, 8) > 0.065,
+        }
+
+    # Additional single-hand poses (BATHROOM, NO, YOU)
+    # BATHROOM: closed fist with thumb sticking clearly outward (away from index PIP)
+    is_bathroom_thumb = is_fist and ext_thumb and dist(4, 6) > 0.09 and dist(4, 17) > dist(3, 17) * 1.15
+    # NO: index + middle extended together, ring + pinky curled
+    is_two_fingers = (not is_fist) and (not is_bunched) and ext_idx and ext_mid and curl_ring and curl_pinky
+    # YOU: pointing straight forward at camera (foreshortened 2D index & tip z closer than MCP z)
+    is_pointing_forward = is_pointing and (
+        (primary[8][2] < primary[5][2] - 0.045 and dist(5, 8) < 0.095) or top_label == 'YOU'
+    )
+
+    # ── TWO-HAND SIGNS (ALL 2-HAND ISL POSTER SIGNS) ─────────────────────────
+    two_hand_matched = False
     if two_hands:
         sec = hand_lms_list[1]
         if len(sec) >= 21:
-            sec_ext_idx = joint_angle(sec[5], sec[6], sec[8]) >= EXT
-            sec_num_ext = sum([
-                joint_angle(sec[5], sec[6], sec[8])  >= EXT,
-                joint_angle(sec[9], sec[10], sec[12]) >= EXT,
-                joint_angle(sec[13], sec[14], sec[16]) >= EXT,
-                joint_angle(sec[17], sec[18], sec[20]) >= EXT,
-            ])
-            both_open = (num_ext >= 3) and (sec_num_ext >= 3)
-            if both_open and is_moving:
-                boost('WHAT', factor=7.0, suppress=['HELLO', 'WELCOME', 'WANT', 'WHERE'])
-            elif both_open and is_static:
-                boost('NICE', factor=5.0)
-            elif is_pointing and sec_ext_idx and not in_chest_zone:
-                boost('WHERE', factor=6.0, suppress=['UNDERSTAND', 'I', 'WHAT'])
+            # Sort left vs right in screen space
+            h_left, h_right = (primary, sec) if primary[0][0] <= sec[0][0] else (sec, primary)
+            sL = _hand_stats(h_left)
+            sR = _hand_stats(h_right)
 
-    # Mutually-exclusive single-hand disambiguation
-    if is_bunched:
-        boost('FOOD', factor=9.0, suppress=['THANK_YOU', 'YES', 'I', 'MY', 'HELLO', 'WANT', 'WATER'])
-    elif is_w_pose:
-        boost('WATER', factor=9.0, suppress=['FOOD', 'THANK_YOU', 'YES', 'HELLO', 'WANT'])
-    elif is_pointing:
-        if in_temple_zone:
-            boost('UNDERSTAND', factor=9.0, suppress=['HELLO', 'I', 'YES', 'MY', 'WHERE'])
-        else:
-            boost('I', factor=9.0, suppress=['YES', 'UNDERSTAND', 'MY', 'FOOD', 'WANT', 'WHERE'])
-    elif is_fist:
-        boost('YES', factor=9.0, suppress=['I', 'FOOD', 'THANK_YOU', 'MY', 'WANT', 'WHAT'])
-    elif is_open_palm:
-        if in_temple_zone:
-            boost('HELLO', factor=9.0, suppress=['UNDERSTAND', 'MY', 'THANK_YOU', 'WANT', 'WHAT'])
-        elif in_chest_zone:
-            if is_moving:
-                boost('WANT', factor=8.0, suppress=['MY', 'THANK_YOU', 'I', 'HELLO', 'FOOD'])
+            def cross_dist(a_idx, b_idx):
+                return np.linalg.norm(np.array(h_left[a_idx][:2]) - np.array(h_right[b_idx][:2]))
+
+            wrist_dist = cross_dist(0, 0)
+            palm_dist  = cross_dist(9, 9)
+            tip_dist   = cross_dist(8, 8)
+
+            # 1. TIME: one hand pointing at the wrist of the other hand
+            l_to_r_wrist = cross_dist(8, 0) < 0.12 and sL["is_point"]
+            r_to_l_wrist = np.linalg.norm(np.array(h_right[8][:2]) - np.array(h_left[0][:2])) < 0.12 and sR["is_point"]
+            if l_to_r_wrist or r_to_l_wrist:
+                boost('TIME', factor=8.0, suppress=['I', 'YOU', 'UNDERSTAND', 'THIS_PLACE', 'WHERE'])
+                two_hand_matched = True
+
+            # 2. THIS_PLACE: both index fingers pointing downward (tip_y > mcp_y + 0.03)
+            elif (sL["is_point"] and sR["is_point"]
+                  and h_left[8][1] > h_left[5][1] + 0.03
+                  and h_right[8][1] > h_right[5][1] + 0.03):
+                boost('THIS_PLACE', factor=8.0, suppress=['TO_MEET', 'WHERE', 'I', 'UNDERSTAND'])
+                two_hand_matched = True
+
+            # 3. TO_MEET: both index fingers pointing upward near each other
+            elif (sL["is_point"] and sR["is_point"]
+                  and h_left[8][1] < h_left[5][1] - 0.03
+                  and h_right[8][1] < h_right[5][1] - 0.03
+                  and tip_dist < 0.24):
+                boost('TO_MEET', factor=8.0, suppress=['THIS_PLACE', 'WHERE', 'I', 'UNDERSTAND'])
+                two_hand_matched = True
+
+            # 4. WHERE: both index fingers pointing outward/wide
+            elif sL["is_point"] and sR["is_point"]:
+                boost('WHERE', factor=7.0, suppress=['UNDERSTAND', 'I', 'WHAT', 'THIS_PLACE'])
+                two_hand_matched = True
+
+            # 5. NAME_IS: both hands have index+middle extended (H-shape) close together
+            elif sL["is_two"] and sR["is_two"] and tip_dist < 0.22:
+                boost('NAME_IS', factor=8.0, suppress=['NO', 'NICE', 'PLEASE', 'HELP'])
+                two_hand_matched = True
+
+            # 6. HELP: one closed fist resting on top of the other open palm
+            elif ((sL["is_fist"] and sR["is_open"]) or (sR["is_fist"] and sL["is_open"])) and palm_dist < 0.24:
+                boost('HELP', factor=8.0, suppress=['YES', 'SORRY', 'MY', 'THANK_YOU', 'PLEASE'])
+                two_hand_matched = True
+
+            # 7. PLEASE: both open palms pressed together (namaste/prayer) in front of chest
+            elif sL["is_open"] and sR["is_open"] and palm_dist < 0.14:
+                boost('PLEASE', factor=8.0, suppress=['MY', 'THANK_YOU', 'NICE', 'WELCOME', 'WHAT'])
+                two_hand_matched = True
+
+            # 8. DONT: both open palms crossed in X (wrists crossed or very close, fingertips crossed)
+            elif sL["is_open"] and sR["is_open"] and (h_left[8][0] > h_right[8][0] - 0.04) and wrist_dist < 0.25:
+                boost('DONT', factor=8.0, suppress=['WELCOME', 'WHAT', 'NICE', 'HELLO'])
+                two_hand_matched = True
+
+            # 9. WELCOME / WHAT / NICE / WANT (both open palms)
+            elif sL["is_open"] and sR["is_open"]:
+                if wrist_dist > 0.30 and is_static:
+                    boost('WELCOME', factor=7.0, suppress=['HELLO', 'MY', 'THANK_YOU'])
+                    two_hand_matched = True
+                elif is_moving and should_disambiguate({'WHAT', 'WELCOME', 'WANT', 'WHERE', 'HELLO'}):
+                    boost('WHAT', factor=7.0, suppress=['HELLO', 'WELCOME', 'WANT', 'WHERE'])
+                    two_hand_matched = True
+                elif is_static and palm_dist < 0.24 and should_disambiguate({'NICE', 'TO_MEET', 'WELCOME', 'PLEASE'}):
+                    boost('NICE', factor=6.0, suppress=['HELLO', 'MY', 'THANK_YOU'])
+                    two_hand_matched = True
+
+    # ── SINGLE-HAND DISAMBIGUATION (when no 2-hand pose already matched) ──────
+    if not two_hand_matched:
+        if is_bunched and should_disambiguate({'FOOD', 'THANK_YOU', 'WATER', 'YES', 'I'}):
+            boost('FOOD', factor=9.0, suppress=['THANK_YOU', 'YES', 'I', 'MY', 'HELLO', 'WANT', 'WATER'])
+        elif is_w_pose and should_disambiguate({'WATER', 'FOOD', 'THANK_YOU', 'YES', 'HELLO'}):
+            boost('WATER', factor=9.0, suppress=['FOOD', 'THANK_YOU', 'YES', 'HELLO', 'WANT'])
+        elif is_ily:
+            boost('I_LOVE_YOU', factor=8.0, suppress=['I', 'YES', 'HELLO', 'WHAT', 'WANT'])
+        elif is_bathroom_thumb and should_disambiguate({'BATHROOM'}):
+            boost('BATHROOM', factor=8.0, suppress=['YES', 'SORRY', 'I', 'MY'])
+        elif is_two_fingers and should_disambiguate({'NO', 'NAME_IS', 'WATER', 'I', 'YES'}):
+            boost('NO', factor=7.0, suppress=['YES', 'I', 'WATER'])
+        elif is_pointing and should_disambiguate({'I', 'YOU', 'UNDERSTAND', 'YES', 'HELLO', 'MY'}):
+            if in_temple_zone:
+                boost('UNDERSTAND', factor=9.0, suppress=['HELLO', 'I', 'YOU', 'YES', 'MY', 'WHERE'])
+            elif is_pointing_forward:
+                boost('YOU', factor=8.0, suppress=['I', 'YES', 'UNDERSTAND', 'MY'])
             else:
-                boost('MY', factor=9.0, suppress=['I', 'THANK_YOU', 'FOOD', 'HELLO', 'WANT'])
-        else:
-            boost('THANK_YOU', factor=8.0, suppress=['FOOD', 'MY', 'HELLO', 'WANT', 'YES'])
-    elif is_ily:
-        boost('I_LOVE_YOU', factor=9.0, suppress=['I', 'YES', 'HELLO', 'WHAT', 'WANT'])
-    elif is_ok_circle:
-        ok_i  = LABEL_TO_IDX.get('OKAY', -1)
-        ind_i = LABEL_TO_IDX.get('INDIAN', -1)
-        if ok_i >= 0 and ind_i >= 0:
-            winner = 'OKAY' if p[ok_i] >= p[ind_i] else 'INDIAN'
-            boost(winner, factor=6.0)
+                boost('I', factor=9.0, suppress=['YES', 'YOU', 'UNDERSTAND', 'MY', 'FOOD', 'WANT', 'WHERE'])
+        elif is_fist and should_disambiguate({'YES', 'SORRY', 'I', 'FOOD', 'THANK_YOU', 'MY'}):
+            if in_chest_zone and top_label == 'SORRY':
+                boost('SORRY', factor=8.0, suppress=['YES', 'I', 'MY'])
+            else:
+                boost('YES', factor=9.0, suppress=['I', 'FOOD', 'THANK_YOU', 'MY', 'WANT', 'WHAT'])
+        elif is_open_palm and should_disambiguate({'HELLO', 'UNDERSTAND', 'MY', 'WANT', 'THANK_YOU', 'FOOD', 'PLEASE'}):
+            if in_temple_zone:
+                boost('HELLO', factor=9.0, suppress=['UNDERSTAND', 'MY', 'THANK_YOU', 'WANT', 'WHAT'])
+            elif in_chest_zone:
+                if top_label == 'PLEASE':
+                    boost('PLEASE', factor=7.0, suppress=['MY', 'THANK_YOU', 'HELLO'])
+                elif is_moving:
+                    boost('WANT', factor=8.0, suppress=['MY', 'THANK_YOU', 'I', 'HELLO', 'FOOD'])
+                else:
+                    boost('MY', factor=9.0, suppress=['I', 'THANK_YOU', 'FOOD', 'HELLO', 'WANT'])
+            else:
+                boost('THANK_YOU', factor=8.0, suppress=['FOOD', 'MY', 'HELLO', 'WANT', 'YES'])
+        elif is_ok_circle and should_disambiguate({'OKAY', 'INDIAN'}):
+            ok_i  = LABEL_TO_IDX.get('OKAY', -1)
+            ind_i = LABEL_TO_IDX.get('INDIAN', -1)
+            if ok_i >= 0 and ind_i >= 0:
+                winner = 'INDIAN' if (in_chest_zone or p[ind_i] > p[ok_i]) else 'OKAY'
+                boost(winner, factor=6.0)
 
     # Normalize distribution
     s = np.sum(p)
@@ -381,19 +506,25 @@ def extract_landmarks(results):
     left = [0.0] * 63
     right = [0.0] * 63
 
-    for idx in valid_indices:
-        hand_landmarks = results.multi_hand_landmarks[idx]
-        classifications = getattr(results.multi_handedness[idx], 'classification', [])
-        hand_label = classifications[0].label if classifications else "Right"
-
+    if len(valid_indices) == 1:
+        # Always map single-hand gestures to the Right slot (63..125) regardless of mirrored handedness
+        hand_landmarks = results.multi_hand_landmarks[valid_indices[0]]
         coords = []
         for lm in hand_landmarks.landmark:
             coords.extend([lm.x, lm.y, lm.z])
-
-        if hand_label == "Left":
-            left = coords
-        else:
-            right = coords
+        right = coords
+    else:
+        # Two-hand gestures: assign by wrist x-position (leftmost -> Left slot, rightmost -> Right slot)
+        hand_entries = []
+        for idx in valid_indices[:2]:
+            hand_landmarks = results.multi_hand_landmarks[idx]
+            coords = []
+            for lm in hand_landmarks.landmark:
+                coords.extend([lm.x, lm.y, lm.z])
+            hand_entries.append((hand_landmarks.landmark[0].x, coords))
+        hand_entries.sort(key=lambda item: item[0])
+        left = hand_entries[0][1]
+        right = hand_entries[1][1]
 
     points = np.array(left + right, dtype=np.float32).reshape(42, 3)
 
@@ -575,6 +706,8 @@ def generate_frames():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     frame_counter = 0
+    cached_face_info = None
+    face_cache_age = 0
 
     try:
         while True:
@@ -582,12 +715,17 @@ def generate_frames():
             if not success or frame is None:
                 break
 
-            # Mirror view for natural interaction
+            # Mirror view for natural interaction (display frame stays untouched)
             frame = cv2.flip(frame, 1)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Enhance luminance with CLAHE for MediaPipe detection only
+            ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+            ycrcb[:, :, 0] = _clahe.apply(ycrcb[:, :, 0])
+            enhanced_bgr = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+            rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
             results = hands.process(rgb)
 
-            # Ultra-fast face detection (< 4ms on CPU) for facial zones (mouth, chin, temple)
+            # Full-range face detection with 15-frame occlusion cache (keeps zones stable when hand covers mouth)
             face_results = face_detector.process(rgb)
             face_info = None
             if face_results and face_results.detections:
@@ -605,6 +743,11 @@ def generate_frames():
                     "temple_y": nose[1] - (mouth[1] - nose[1]) * 0.8,
                     "head_top": bbox.ymin
                 }
+                cached_face_info = face_info
+                face_cache_age = 0
+            elif cached_face_info is not None and face_cache_age < 15:
+                face_info = cached_face_info
+                face_cache_age += 1
 
             # NOTE: Palm lines and skeletal drawing are completely removed as requested.
             # The raw camera frame remains clean and natural.
