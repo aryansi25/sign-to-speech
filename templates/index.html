@@ -646,6 +646,7 @@ button:disabled{
 
     <div class="camera-wrap">
       <img id="video-feed" src="" alt="Live Camera Feed" style="display:none"/>
+      <video id="webcam-video" autoplay playsinline muted style="display:none;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);"></video>
       <div class="cam-placeholder" id="cam-placeholder">
         <div class="cam-icon">📷</div>
         <strong>Your camera is ready</strong>
@@ -746,6 +747,7 @@ button:disabled{
 
 <script>
 const API = '';
+const VERCEL_MODE = {{ 'true' if vercel_mode else 'false' }};
 let pollingInterval = null;
 let lastEventId = 0;
 let sentenceWords = [];
@@ -754,8 +756,13 @@ let isSpeakerEnabled = true;
 let toastTimer = null;
 let activeAudio = null;
 let lastFeedbackWord = null;
+let webcamStream = null;
+let browserHands = null;
+let browserCamRunning = false;
+let browserRafId = null;
 
 const videoFeed = document.getElementById('video-feed');
+const webcamVideo = document.getElementById('webcam-video');
 const camPlaceholder = document.getElementById('cam-placeholder');
 const holdBar = document.getElementById('hold-bar');
 const holdLabel = document.getElementById('hold-label');
@@ -851,8 +858,12 @@ langSelect.addEventListener('change', () => {
 });
 
 /* START CAMERA */
-document.getElementById('btn-start-cam').addEventListener('click', () => {
+document.getElementById('btn-start-cam').addEventListener('click', async () => {
   unlockAudioContext();
+  if (VERCEL_MODE) {
+    await startBrowserCamera();
+    return;
+  }
   videoFeed.src = `${API}/video_feed?t=${Date.now()}`;
   videoFeed.style.display = 'block';
   camPlaceholder.style.display = 'none';
@@ -866,11 +877,15 @@ document.getElementById('btn-start-cam').addEventListener('click', () => {
 /* STOP CAMERA */
 document.getElementById('btn-stop-cam').addEventListener('click', async () => {
   stopPolling();
-  videoFeed.src = '';
-  videoFeed.style.display = 'none';
-  try {
-    await apiRequest('/api/stop_camera', {method: 'POST'});
-  } catch(e) {}
+  if (VERCEL_MODE) {
+    stopBrowserCamera();
+  } else {
+    videoFeed.src = '';
+    videoFeed.style.display = 'none';
+    try {
+      await apiRequest('/api/stop_camera', {method: 'POST'});
+    } catch(e) {}
+  }
 
   camPlaceholder.style.display = 'flex';
   document.getElementById('btn-start-cam').style.display = 'inline-flex';
@@ -884,6 +899,226 @@ document.getElementById('btn-stop-cam').addEventListener('click', async () => {
   signConf.textContent = '';
   showToast('⏹ Camera stopped');
 });
+
+/* BROWSER WEBCAM + MEDIAPIPE HANDS (VERCEL SERVERLESS MODE) */
+let browserHoldSign = null;
+let browserHoldCount = 0;
+let browserLastCommitted = null;
+let browserRepeatCount = 0;
+let browserLastCommitTime = 0;
+let browserPrevWrist = null;
+let browserLocalTrans = {};
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) return resolve();
+    const s = document.createElement('script');
+    s.src = src;
+    s.crossOrigin = 'anonymous';
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+function jAngle(a, b, c) {
+  const v1x = a.x - b.x, v1y = a.y - b.y;
+  const v2x = c.x - b.x, v2y = c.y - b.y;
+  const n1 = Math.hypot(v1x, v1y), n2 = Math.hypot(v2x, v2y);
+  if (n1 < 1e-7 || n2 < 1e-7) return 180;
+  const cos = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / (n1 * n2)));
+  return (Math.acos(cos) * 180) / Math.PI;
+}
+
+function jDist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function handStatsJS(h) {
+  const extIdx = jAngle(h[5], h[6], h[8]) >= 148;
+  const extMid = jAngle(h[9], h[10], h[12]) >= 148;
+  const extRing = jAngle(h[13], h[14], h[16]) >= 148;
+  const extPinky = jAngle(h[17], h[18], h[20]) >= 148;
+  const extThumb = jAngle(h[1], h[2], h[4]) >= 128;
+  const curlIdx = jAngle(h[5], h[6], h[8]) <= 115;
+  const curlMid = jAngle(h[9], h[10], h[12]) <= 115;
+  const curlRing = jAngle(h[13], h[14], h[16]) <= 115;
+  const curlPinky = jAngle(h[17], h[18], h[20]) <= 115;
+  const numExt = [extIdx, extMid, extRing, extPinky].filter(Boolean).length;
+  const numCurl = [curlIdx, curlMid, curlRing, curlPinky].filter(Boolean).length;
+  const palmSpan = Math.max(jDist(h[0], h[9]), 0.04);
+  const dThumbIdx = jDist(h[4], h[8]) / palmSpan;
+  const dIdxMid = jDist(h[8], h[12]) / palmSpan;
+  const dThumbMid = jDist(h[4], h[12]) / palmSpan;
+  const isFist = curlIdx && curlMid && curlRing && curlPinky;
+  const isBunched = !isFist && dThumbIdx < 0.65 && dIdxMid < 0.55 && dThumbMid < 0.72 && (numExt >= 1 || numCurl <= 2);
+  const isWPose = !isFist && !isBunched && extIdx && extMid && extRing && curlPinky;
+  const isILY = !isFist && !isBunched && extIdx && extPinky && extThumb && curlMid && curlRing;
+  const isOk = !isFist && !isBunched && dThumbIdx < 0.45 && (extMid || extRing || extPinky);
+  const isPoint = !isFist && !isBunched && !isWPose && !isOk && !isILY && extIdx && curlMid && curlRing && curlPinky;
+  const isTwo = !isFist && !isBunched && extIdx && extMid && curlRing && curlPinky;
+  const isOpen = !isFist && !isBunched && !isWPose && !isOk && !isPoint && !isILY && numExt >= 3 && dThumbIdx > 0.45;
+  const isBath = isFist && extThumb && (jDist(h[4], h[6]) / palmSpan) > 0.65 && jDist(h[4], h[17]) > jDist(h[3], h[17]) * 1.15;
+  return { h, palmSpan, isFist, isBunched, isWPose, isILY, isOk, isPoint, isTwo, isOpen, isBath };
+}
+
+function classifyLandmarksJS(multiHands, velocity) {
+  if (!multiHands || multiHands.length === 0) return { sign: null, conf: 0 };
+  const isMoving = velocity > 0.013;
+  const isStatic = velocity < 0.007;
+  if (multiHands.length >= 2) {
+    const [hA, hB] = multiHands[0][0].x <= multiHands[1][0].x ? [multiHands[0], multiHands[1]] : [multiHands[1], multiHands[0]];
+    const sL = handStatsJS(hA), sR = handStatsJS(hB);
+    const wristDist = jDist(hA[0], hB[0]), palmDist = jDist(hA[9], hB[9]), tipDist = jDist(hA[8], hB[8]);
+    if ((jDist(hA[8], hB[0]) < 0.12 && sL.isPoint) || (jDist(hB[8], hA[0]) < 0.12 && sR.isPoint)) return { sign: 'TIME', conf: 94 };
+    if (sL.isPoint && sR.isPoint && hA[8].y > hA[5].y + 0.03 && hB[8].y > hB[5].y + 0.03) return { sign: 'THIS_PLACE', conf: 93 };
+    if (sL.isPoint && sR.isPoint && hA[8].y < hA[5].y - 0.03 && hB[8].y < hB[5].y - 0.03 && tipDist < 0.24) return { sign: 'TO_MEET', conf: 93 };
+    if (sL.isPoint && sR.isPoint) return { sign: 'WHERE', conf: 90 };
+    if (sL.isTwo && sR.isTwo && tipDist < 0.22) return { sign: 'NAME_IS', conf: 93 };
+    if (((sL.isFist && sR.isOpen) || (sR.isFist && sL.isOpen)) && palmDist < 0.24) return { sign: 'HELP', conf: 94 };
+    if (sL.isOpen && sR.isOpen && palmDist < 0.14) return { sign: 'PLEASE', conf: 94 };
+    if (sL.isOpen && sR.isOpen && hA[8].x > hB[8].x - 0.04 && wristDist < 0.25) return { sign: 'DONT', conf: 93 };
+    if (sL.isOpen && sR.isOpen) {
+      if (wristDist > 0.30 && isStatic) return { sign: 'WELCOME', conf: 92 };
+      if (isMoving) return { sign: 'WHAT', conf: 90 };
+      if (palmDist < 0.24) return { sign: 'NICE', conf: 90 };
+    }
+  }
+  const s = handStatsJS(multiHands[0]);
+  const h = s.h;
+  const minY = Math.min(...h.map(p => p.y));
+  const inTemple = minY < 0.27;
+  const inChest = h[9].y > 0.50;
+  const idxDx = h[8].x - h[5].x, idxDy = h[8].y - h[5].y, idxDz = (h[8].z || 0) - (h[5].z || 0);
+  const handDx = h[9].x - h[0].x, handDy = h[9].y - h[0].y;
+  const handHoriz = Math.abs(handDx) > Math.abs(handDy) * 1.15 && Math.abs(handDx) > 0.02;
+  const pointFwd = s.isPoint && idxDz < -0.035 && (Math.hypot(idxDx, idxDy) / s.palmSpan) < 0.72;
+
+  if (s.isBunched) return { sign: 'FOOD', conf: 95 };
+  if (s.isWPose) return { sign: 'WATER', conf: 95 };
+  if (s.isILY) return { sign: 'I_LOVE_YOU', conf: 96 };
+  if (s.isBath) return { sign: 'BATHROOM', conf: 93 };
+  if (s.isTwo) return { sign: 'NO', conf: 93 };
+  if (s.isPoint) {
+    if (inTemple) return { sign: 'UNDERSTAND', conf: 94 };
+    if (pointFwd) return { sign: 'YOU', conf: 92 };
+    return { sign: 'I', conf: 93 };
+  }
+  if (s.isFist) {
+    if (inChest && (handHoriz || isMoving)) return { sign: 'SORRY', conf: 92 };
+    return { sign: 'YES', conf: 94 };
+  }
+  if (s.isOpen) {
+    if (inTemple && !handHoriz) return { sign: 'HELLO', conf: 95 };
+    if (inChest) return { sign: isMoving && !handHoriz ? 'WANT' : 'MY', conf: 92 };
+    return { sign: 'THANK_YOU', conf: 93 };
+  }
+  if (s.isOk) return { sign: inChest ? 'INDIAN' : 'OKAY', conf: 93 };
+  return { sign: null, conf: 0 };
+}
+
+async function startBrowserCamera() {
+  try {
+    showToast('⏳ Starting browser camera & MediaPipe Hands...');
+    await loadScriptOnce('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
+    try {
+      const trRes = await apiRequest(`/api/benchmark_translations?lang=${encodeURIComponent(currentTargetLang)}`);
+      browserLocalTrans = await trRes.json();
+    } catch(e) {}
+
+    webcamStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    webcamVideo.srcObject = webcamStream;
+    await webcamVideo.play();
+    webcamVideo.style.display = 'block';
+    camPlaceholder.style.display = 'none';
+    document.getElementById('btn-start-cam').style.display = 'none';
+    document.getElementById('btn-stop-cam').style.display = 'inline-flex';
+    setCameraStatus(true);
+
+    if (!browserHands) {
+      browserHands = new window.Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+      browserHands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.55, minTrackingConfidence: 0.55 });
+      browserHands.onResults((results) => {
+        if (!browserCamRunning) return;
+        const multiHands = results.multiHandLandmarks || [];
+        const hasHands = multiHands.length > 0;
+        let velocity = 0;
+        if (hasHands) {
+          const w = multiHands[0][0];
+          if (browserPrevWrist) velocity = Math.hypot(w.x - browserPrevWrist.x, w.y - browserPrevWrist.y);
+          browserPrevWrist = { x: w.x, y: w.y };
+        } else {
+          browserPrevWrist = null;
+          browserHoldSign = null;
+          browserHoldCount = 0;
+        }
+
+        const res = (hasHands && velocity <= 0.045) ? classifyLandmarksJS(multiHands, velocity) : { sign: null, conf: 0 };
+        const now = Date.now();
+        let newWord = null;
+        let nextEventId = lastEventId;
+        if (res.sign) {
+          if (browserHoldSign === res.sign) browserHoldCount++;
+          else { browserHoldSign = res.sign; browserHoldCount = 1; }
+
+          const reqHold = res.conf >= 85 ? 2 : 3;
+          const elapsed = now - browserLastCommitTime;
+          const canCommit = res.sign !== browserLastCommitted
+            ? elapsed >= 1000
+            : (browserRepeatCount < 2 && elapsed >= 1600);
+
+          if (browserHoldCount >= reqHold && canCommit) {
+            nextEventId = lastEventId + 1;
+            newWord = res.sign;
+            browserRepeatCount = (res.sign === browserLastCommitted) ? browserRepeatCount + 1 : 1;
+            browserLastCommitted = res.sign;
+            browserLastCommitTime = now;
+            browserHoldCount = 0;
+          }
+        } else {
+          browserHoldCount = Math.max(0, browserHoldCount - 1);
+        }
+
+        updateUI({
+          hands_in_frame: hasHands,
+          current_sign: res.sign,
+          current_sign_translated: res.sign ? (browserLocalTrans[res.sign] || res.sign.replace(/_/g, ' ')) : null,
+          confidence: res.conf,
+          hold_progress: res.sign ? Math.min(100, Math.round((browserHoldCount / 3) * 100)) : 0,
+          event_id: nextEventId,
+          new_word: newWord,
+          new_word_translated: newWord ? (browserLocalTrans[newWord] || newWord.replace(/_/g, ' ')) : null,
+        });
+      });
+    }
+
+    browserCamRunning = true;
+    const processFrame = async () => {
+      if (!browserCamRunning) return;
+      if (webcamVideo.readyState >= 2) {
+        try { await browserHands.send({ image: webcamVideo }); } catch(e) {}
+      }
+      browserRafId = requestAnimationFrame(processFrame);
+    };
+    browserRafId = requestAnimationFrame(processFrame);
+    showToast('📷 Browser camera active & live gesture detection running');
+  } catch (err) {
+    showToast('Camera permission denied or unavailable: ' + err.message);
+  }
+}
+
+function stopBrowserCamera() {
+  browserCamRunning = false;
+  if (browserRafId) cancelAnimationFrame(browserRafId);
+  if (webcamStream) {
+    webcamStream.getTracks().forEach(t => t.stop());
+    webcamStream = null;
+  }
+  webcamVideo.srcObject = null;
+  webcamVideo.style.display = 'none';
+}
 
 function startPolling(){
   stopPolling();

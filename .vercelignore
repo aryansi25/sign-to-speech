@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+feedback_dataset/
+screenshots/
+benchmark_test_data.npz
+isl_lstm_model.keras
+labels.npy
+collect_sequences.py
+train_lstm_model.py
+check_accuracy.py
+generate_benchmark_data.py
+test_suite.py
+app.py
+requirements-local.txt
