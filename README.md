@@ -16,9 +16,6 @@ GestureTalk is a real-time, low-latency assistive communication platform that tr
 ### 🤟 Complete ISL Gesture Vocabulary Guide
 GestureTalk detects and translates all 27 standard ISL signs across 5 functional categories:
 
-![GestureTalk ISL Gesture Guide](screenshots/isl_gestures_guide.png)
-
-### 🤟 Recognized Indian Sign Language (ISL) Gestures
 ![Indian Sign Language Supported Vocabulary](screenshots/isl_gestures_chart.png)
 
 ---
@@ -199,7 +196,6 @@ GestureTalk/
 │
 └── screenshots/
     ├── isl_gestures_chart.png     # ISL recognized vocabulary visual poster
-    ├── isl_gestures_guide.png     # Gesture reference guide poster
     └── benchmark_test_results.png # Full 27-sign live benchmark results report
 ```
 

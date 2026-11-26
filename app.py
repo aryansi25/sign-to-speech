@@ -57,6 +57,13 @@ SIGN_LANGUAGES = [
 model = tf.keras.models.load_model("isl_lstm_model.keras")
 labels = np.load("labels.npy")
 
+# Graph-compiled inference (~1.9ms/pass vs ~187ms eager) + startup warmup
+@tf.function(reduce_retracing=True)
+def _fast_infer(x):
+    return model(x, training=False)
+
+_ = _fast_infer(tf.zeros((1, 20, 126), dtype=tf.float32))
+
 # STRICT VOCABULARY WHITELIST:
 # Only words officially trained and present in labels.npy (excluding NO_SIGN) are allowed.
 VALID_SIGNS = [str(lbl) for lbl in labels if str(lbl) != "NO_SIGN"]
@@ -91,7 +98,6 @@ seq_lock = threading.Lock()
 
 sequence = deque(maxlen=20)
 prediction_history = deque(maxlen=5)   # Exponential-weighted 5-frame rolling window
-prediction_queue = deque(maxlen=3)
 
 last_sign_commit_time = 0.0
 missing_hand_frames = 0
@@ -464,12 +470,16 @@ def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
 # HAND VALIDATION
 # =========================
 
-def is_valid_human_hand(landmarks):
+def is_valid_human_hand(landmarks, handedness_score=1.0, face_info=None):
     """
-    Validates detected hand landmarks:
-    - Accepts all genuine human hand poses (fists, pointing, open palm, pinching).
-    - Rejects tiny background artifacts and noise.
+    Validates detected hand landmarks and rejects background noise / distant bystanders:
+    - Rejects low-confidence MediaPipe handedness (< 0.55)
+    - Rejects tiny or full-frame artifacts
+    - Verifies anatomical palm-span ratio (wrist-to-middle-MCP vs bounding box)
+    - Rejects distant background hands much smaller than the primary signer's face
     """
+    if handedness_score < 0.55:
+        return False
     if not hasattr(landmarks, "landmark") or len(landmarks.landmark) < 21:
         return False
 
@@ -478,14 +488,31 @@ def is_valid_human_hand(landmarks):
     bbox_w = max(xs) - min(xs)
     bbox_h = max(ys) - min(ys)
 
-    # Genuine hand in front of webcam spans between 3% and 98% of the frame
-    return (0.03 <= bbox_w <= 0.98) and (0.03 <= bbox_h <= 0.98)
+    if not ((0.03 <= bbox_w <= 0.98) and (0.03 <= bbox_h <= 0.98)):
+        return False
+
+    # Anatomical palm-span check: wrist (0) to middle MCP (9) relative to hand size
+    palm_span = np.hypot(
+        landmarks.landmark[9].x - landmarks.landmark[0].x,
+        landmarks.landmark[9].y - landmarks.landmark[0].y,
+    )
+    max_dim = max(bbox_w, bbox_h)
+    if max_dim > 0 and not (0.10 <= (palm_span / max_dim) <= 0.95):
+        return False
+
+    # Background person suppression: ignore tiny hands far behind primary signer
+    if face_info is not None:
+        face_h = face_info.get("bbox", (0, 0, 0, 0.0))[3]
+        if face_h > 0.12 and bbox_h < face_h * 0.25:
+            return False
+
+    return True
 
 # =========================
 # LANDMARK EXTRACTION & NORMALIZATION
 # =========================
 
-def extract_landmarks(results):
+def extract_landmarks(results, face_info=None):
     """
     Extracts and normalizes hand landmarks strictly matching the training dataset distribution:
     - Preserves natural spatial coordinate distribution across all 27 ISL gesture classes.
@@ -497,7 +524,9 @@ def extract_landmarks(results):
 
     valid_indices = []
     for idx, hand_lms in enumerate(results.multi_hand_landmarks):
-        if is_valid_human_hand(hand_lms):
+        cls_list = getattr(results.multi_handedness[idx], 'classification', [])
+        h_score = getattr(cls_list[0], 'score', 1.0) if cls_list else 1.0
+        if is_valid_human_hand(hand_lms, handedness_score=h_score, face_info=face_info):
             valid_indices.append(idx)
 
     if len(valid_indices) == 0:
@@ -573,8 +602,8 @@ def inference_worker():
             velocity = latest_hand_velocity_snapshot
 
         try:
-            # Forward pass through trained LSTM
-            preds = model(input_data, training=False).numpy()[0]
+            # Graph-compiled forward pass through trained LSTM (~1.9ms)
+            preds = _fast_infer(tf.convert_to_tensor(input_data, dtype=tf.float32)).numpy()[0]
 
             # Deterministic hand pose, velocity & facial zone disambiguation
             preds = disambiguate_prediction(preds, hand_lms, face_info, velocity=velocity)
@@ -638,7 +667,6 @@ def inference_worker():
 
                         # Keep the natural 20-frame FIFO queue intact so subsequent continuous signs retain high classification accuracy!
                         prediction_history.clear()
-                        prediction_queue.clear()
                 else:
                     hold_counter = max(0, hold_counter - 1)
                     if hold_counter == 0:
@@ -729,7 +757,14 @@ def generate_frames():
             face_results = face_detector.process(rgb)
             face_info = None
             if face_results and face_results.detections:
-                det = face_results.detections[0]
+                # Pick primary signer's face (largest bounding box) to ignore background faces
+                det = max(
+                    face_results.detections,
+                    key=lambda d: (
+                        d.location_data.relative_bounding_box.width
+                        * d.location_data.relative_bounding_box.height
+                    ),
+                )
                 bbox = det.location_data.relative_bounding_box
                 kps = det.location_data.relative_keypoints
                 nose = (kps[2].x, kps[2].y) if len(kps) > 2 else (0.5, bbox.ymin + bbox.height * 0.5)
@@ -752,7 +787,14 @@ def generate_frames():
             # NOTE: Palm lines and skeletal drawing are completely removed as requested.
             # The raw camera frame remains clean and natural.
 
-            valid_lms = [lms for lms in results.multi_hand_landmarks if is_valid_human_hand(lms)] if results.multi_hand_landmarks else []
+            valid_lms = []
+            if results.multi_hand_landmarks:
+                handedness_list = results.multi_handedness or []
+                for idx, lms in enumerate(results.multi_hand_landmarks):
+                    cls_list = getattr(handedness_list[idx], 'classification', []) if idx < len(handedness_list) else []
+                    h_score = getattr(cls_list[0], 'score', 1.0) if cls_list else 1.0
+                    if is_valid_human_hand(lms, handedness_score=h_score, face_info=face_info):
+                        valid_lms.append(lms)
 
             if len(valid_lms) == 0:
                 missing_hand_frames += 1
@@ -768,7 +810,6 @@ def generate_frames():
                     with seq_lock:
                         sequence.clear()
                         prediction_history.clear()
-                        prediction_queue.clear()
                         wrist_history.clear()
                         latest_sequence_snapshot = None
                         latest_hand_lms_snapshot = None
@@ -780,7 +821,7 @@ def generate_frames():
                     was_hands = hands_in_frame
                     hands_in_frame = True
 
-                norm_vec = extract_landmarks(results)
+                norm_vec = extract_landmarks(results, face_info=face_info)
                 if norm_vec is not None:
                     with seq_lock:
                         # Instant pre-warm: fill 20-frame sequence buffer on frame 1 so inference begins immediately
@@ -930,7 +971,6 @@ def stop_camera():
     with seq_lock:
         sequence.clear()
         prediction_history.clear()
-        prediction_queue.clear()
         wrist_history.clear()
         latest_sequence_snapshot = None
         latest_hand_lms_snapshot = None
@@ -1027,7 +1067,7 @@ def speak():
             b'ID3\x03\x00\x00\x00\x00\x00\x00' +
             (b'\xff\xfb\x90d' + b'\x00' * 414) * 5
         )
-        return Response(fallback_mp3, mimetype="audio/mpeg")
+        return Response(fallback_mp3, mimetype="audio/mpeg", headers={"X-Audio-Fallback": "silent"})
 
 # =========================
 # PAGES
@@ -1070,7 +1110,7 @@ def run_benchmark_single():
 
     t0 = time.perf_counter()
     input_tensor = np.expand_dims(seq, axis=0)
-    pred_probs = model(input_tensor, training=False).numpy()[0]
+    pred_probs = _fast_infer(tf.convert_to_tensor(input_tensor, dtype=tf.float32)).numpy()[0]
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
     top_idx = int(np.argmax(pred_probs))

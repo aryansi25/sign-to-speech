@@ -732,7 +732,6 @@ button:disabled{
 </div>
 
 <div class="toast" id="toast"></div>
-<audio id="audio-player" style="display:none"></audio>
 
 <script>
 const API = '';
@@ -756,7 +755,6 @@ const sentenceBox = document.getElementById('sentence-box');
 const translatedText = document.getElementById('translated-text');
 const customTextInput = document.getElementById('custom-text-input');
 const toast = document.getElementById('toast');
-const audioPlayer = document.getElementById('audio-player');
 const liveStatus = document.getElementById('live-status');
 const liveStatusText = document.getElementById('live-status-text');
 const langSelect = document.getElementById('lang-select');
@@ -1082,7 +1080,8 @@ function speakUtterance(text, language, rate = 1.15, originalWord = ''){
 
   if (matchedVoice) {
     try {
-      window.speechSynthesis.cancel();
+      const wasBusy = window.speechSynthesis.speaking || window.speechSynthesis.pending;
+      if (wasBusy) window.speechSynthesis.cancel();
       const utter = new SpeechSynthesisUtterance(text);
       utter.rate = rate;
       utter.voice = matchedVoice;
@@ -1091,12 +1090,25 @@ function speakUtterance(text, language, rate = 1.15, originalWord = ''){
       utter.onerror = () => {
         playAudioServerFallback(originalWord || text, language);
       };
-      window.speechSynthesis.speak(utter);
+      // Delay slightly after cancel() so Chromium Web Speech does not drop the utterance
+      setTimeout(() => {
+        if (isSpeakerEnabled) window.speechSynthesis.speak(utter);
+      }, wasBusy ? 30 : 0);
       return;
     } catch(e) {}
   }
 
   playAudioServerFallback(originalWord || text, language);
+}
+
+function speakNativeFallback(text, language){
+  if (!isSpeakerEnabled || !text || !('speechSynthesis' in window)) return;
+  try {
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = LANG_LOCALE_MAP[language] || 'en-US';
+    utter.rate = 1.1;
+    window.speechSynthesis.speak(utter);
+  } catch(e) {}
 }
 
 async function playAudioServerFallback(sentence, language){
@@ -1107,8 +1119,15 @@ async function playAudioServerFallback(sentence, language){
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({sentence, language})
     });
+    if(res.headers.get('X-Audio-Fallback') === 'silent'){
+      speakNativeFallback(sentence, language);
+      return;
+    }
     const blob = await res.blob();
-    if(blob.size < 500) throw new Error('Empty audio');
+    if(blob.size < 500){
+      speakNativeFallback(sentence, language);
+      return;
+    }
 
     if(activeAudio){
       try{ activeAudio.pause(); }catch(e){}
@@ -1116,8 +1135,10 @@ async function playAudioServerFallback(sentence, language){
     const url = URL.createObjectURL(blob);
     activeAudio = new Audio(url);
     activeAudio.onended = () => { URL.revokeObjectURL(url); };
-    activeAudio.play().catch(() => {});
-  }catch(e){}
+    activeAudio.play().catch(() => { speakNativeFallback(sentence, language); });
+  }catch(e){
+    speakNativeFallback(sentence, language);
+  }
 }
 
 window.addEventListener('beforeunload', () => {
