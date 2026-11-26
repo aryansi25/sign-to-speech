@@ -348,6 +348,16 @@ header{
   border:1px solid #f5d9dc;
 }
 .btn-danger:hover{background:#ffe5e8}
+.btn-success{
+  background:#1f9d68;
+  color:#ffffff;
+  border:1px solid #198758;
+}
+.btn-success:hover:not(:disabled){background:#188456}
+.btn-success:disabled{
+  opacity:.48;
+  cursor:not-allowed;
+}
 .btn-dark{
   background:#292338;
   color:white;
@@ -667,6 +677,7 @@ button:disabled{
     <div class="camera-controls">
       <button class="btn btn-primary" id="btn-start-cam">▶ Start Camera</button>
       <button class="btn btn-danger" id="btn-stop-cam" style="display:none">⏹ Stop Camera</button>
+      <button class="btn btn-success" id="btn-confirm-correct" disabled title="Confirm that the detected word is correct and train the model on it">✓ Correct — Train Model</button>
     </div>
   </section>
 
@@ -742,6 +753,7 @@ let currentTargetLang = 'Hindi';
 let isSpeakerEnabled = true;
 let toastTimer = null;
 let activeAudio = null;
+let lastFeedbackWord = null;
 
 const videoFeed = document.getElementById('video-feed');
 const camPlaceholder = document.getElementById('cam-placeholder');
@@ -808,6 +820,8 @@ btnSpeakerToggle.addEventListener('click', () => {
     btnSpeakerToggle.className = 'speaker-btn muted';
     speakerIcon.textContent = '🔇';
     speakerStatus.textContent = 'Muted';
+    speechQueue.length = 0;
+    isSpeakingNow = false;
     if ('speechSynthesis' in window) window.speechSynthesis.cancel();
     if (activeAudio) { activeAudio.pause(); }
     showToast('🔇 Audio voice muted');
@@ -852,12 +866,12 @@ document.getElementById('btn-start-cam').addEventListener('click', () => {
 /* STOP CAMERA */
 document.getElementById('btn-stop-cam').addEventListener('click', async () => {
   stopPolling();
+  videoFeed.src = '';
+  videoFeed.style.display = 'none';
   try {
     await apiRequest('/api/stop_camera', {method: 'POST'});
   } catch(e) {}
 
-  videoFeed.src = '';
-  videoFeed.style.display = 'none';
   camPlaceholder.style.display = 'flex';
   document.getElementById('btn-start-cam').style.display = 'inline-flex';
   document.getElementById('btn-stop-cam').style.display = 'none';
@@ -884,13 +898,19 @@ function stopPolling(){
   }
 }
 
-/* GET CAMERA STATE */
+/* GET CAMERA STATE (single in-flight request, no overlap) */
+let isPollingInFlight = false;
 async function pollState(){
+  if(isPollingInFlight) return;
+  isPollingInFlight = true;
   try{
     const res = await apiRequest(`/api/state?last_event_id=${lastEventId}&lang=${encodeURIComponent(currentTargetLang)}`);
     const data = await res.json();
     updateUI(data);
   }catch(e){}
+  finally{
+    isPollingInFlight = false;
+  }
 }
 
 /* UPDATE UI */
@@ -906,6 +926,7 @@ function updateUI(data){
     signMeaning.textContent = `Meaning: ${meaning}`;
     holdLabel.textContent = `Detecting: ${cleanSign} — hold to lock in`;
     signConf.textContent = data.confidence != null ? `${data.confidence}% confidence` : '';
+    updateFeedbackButton(data.current_sign);
   }else{
     signLabel.textContent = data.hands_in_frame ? 'Signing in frame...' : 'Waiting for gesture...';
     signMeaning.textContent = data.hands_in_frame ? 'Keep hand steady to lock in the gesture.' : 'Show a hand gesture clearly in front of the camera.';
@@ -919,6 +940,7 @@ function updateUI(data){
     if(data.new_word){
       const word = data.new_word.replace(/_/g, ' ');
       const trans = data.new_word_translated || word;
+      updateFeedbackButton(data.new_word);
       addWordToSentence(word);
       if(isSpeakerEnabled){
         playInstantAudio(word, trans, currentTargetLang);
@@ -926,6 +948,39 @@ function updateUI(data){
     }
   }
 }
+
+const btnConfirmCorrect = document.getElementById('btn-confirm-correct');
+function updateFeedbackButton(rawSign){
+  if(!rawSign) return;
+  lastFeedbackWord = rawSign;
+  btnConfirmCorrect.disabled = false;
+  btnConfirmCorrect.textContent = `✓ Correct: ${rawSign.replace(/_/g, ' ')} — Train`;
+}
+
+btnConfirmCorrect.addEventListener('click', async () => {
+  if(!lastFeedbackWord) return;
+  const wordToTrain = lastFeedbackWord;
+  btnConfirmCorrect.disabled = true;
+  btnConfirmCorrect.textContent = '⏳ Training...';
+  try{
+    const res = await apiRequest('/api/feedback_correct', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({word: wordToTrain})
+    });
+    const data = await res.json();
+    if(res.ok){
+      showToast(`✓ Confirmed "${wordToTrain.replace(/_/g, ' ')}" — model trained! (${data.total_samples} samples)`);
+    }else{
+      showToast(data.error || 'Could not train on sample');
+    }
+  }catch(e){
+    showToast('Error saving training feedback');
+  }finally{
+    btnConfirmCorrect.disabled = false;
+    btnConfirmCorrect.textContent = `✓ Correct: ${wordToTrain.replace(/_/g, ' ')} — Train`;
+  }
+});
 
 /* ADD WORD TO SENTENCE */
 function addWordToSentence(word){
@@ -1058,13 +1113,39 @@ const LANG_LOCALE_MAP = {
   'Portuguese': 'pt-PT'
 };
 
+/* SEQUENTIAL SPEECH QUEUE: speak one word completely after each gesture is detected */
+const speechQueue = [];
+let isSpeakingNow = false;
+
 function playInstantAudio(word, trans, language){
   const textToSpeak = trans || word;
-  speakUtterance(textToSpeak, language, 1.20, word);
+  enqueueSpeech(textToSpeak, language, 1.08, word);
 }
 
-function speakUtterance(text, language, rate = 1.15, originalWord = ''){
+function enqueueSpeech(text, language, rate = 1.08, originalWord = ''){
   if(!isSpeakerEnabled || !text) return;
+  // Cap queue to 2 pending items so audio never lags behind
+  if(speechQueue.length >= 2) speechQueue.shift();
+  speechQueue.push({text, language, rate, originalWord});
+  if(!isSpeakingNow) processSpeechQueue();
+}
+
+function processSpeechQueue(){
+  if(!isSpeakerEnabled || speechQueue.length === 0){
+    isSpeakingNow = false;
+    return;
+  }
+  isSpeakingNow = true;
+  const item = speechQueue.shift();
+  speakUtterance(item.text, item.language, item.rate, item.originalWord, () => {
+    isSpeakingNow = false;
+    processSpeechQueue();
+  });
+}
+
+function speakUtterance(text, language, rate = 1.15, originalWord = '', onDone = null){
+  const finish = () => { if(typeof onDone === 'function') onDone(); };
+  if(!isSpeakerEnabled || !text){ finish(); return; }
 
   const targetLocale = LANG_LOCALE_MAP[language] || 'en-US';
   const langPrefix = targetLocale.slice(0, 2).toLowerCase();
@@ -1080,39 +1161,39 @@ function speakUtterance(text, language, rate = 1.15, originalWord = ''){
 
   if (matchedVoice) {
     try {
-      const wasBusy = window.speechSynthesis.speaking || window.speechSynthesis.pending;
-      if (wasBusy) window.speechSynthesis.cancel();
       const utter = new SpeechSynthesisUtterance(text);
       utter.rate = rate;
       utter.voice = matchedVoice;
       utter.lang = targetLocale;
       utter.pitch = 1.0;
+      utter.onend = finish;
       utter.onerror = () => {
-        playAudioServerFallback(originalWord || text, language);
+        playAudioServerFallback(originalWord || text, language, finish);
       };
-      // Delay slightly after cancel() so Chromium Web Speech does not drop the utterance
-      setTimeout(() => {
-        if (isSpeakerEnabled) window.speechSynthesis.speak(utter);
-      }, wasBusy ? 30 : 0);
+      window.speechSynthesis.speak(utter);
       return;
     } catch(e) {}
   }
 
-  playAudioServerFallback(originalWord || text, language);
+  playAudioServerFallback(originalWord || text, language, finish);
 }
 
-function speakNativeFallback(text, language){
-  if (!isSpeakerEnabled || !text || !('speechSynthesis' in window)) return;
+function speakNativeFallback(text, language, onDone = null){
+  const finish = () => { if(typeof onDone === 'function') onDone(); };
+  if (!isSpeakerEnabled || !text || !('speechSynthesis' in window)){ finish(); return; }
   try {
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = LANG_LOCALE_MAP[language] || 'en-US';
-    utter.rate = 1.1;
+    utter.rate = 1.08;
+    utter.onend = finish;
+    utter.onerror = finish;
     window.speechSynthesis.speak(utter);
-  } catch(e) {}
+  } catch(e) { finish(); }
 }
 
-async function playAudioServerFallback(sentence, language){
-  if(!isSpeakerEnabled || !sentence) return;
+async function playAudioServerFallback(sentence, language, onDone = null){
+  const finish = () => { if(typeof onDone === 'function') onDone(); };
+  if(!isSpeakerEnabled || !sentence){ finish(); return; }
   try{
     const res = await apiRequest('/api/speak', {
       method: 'POST',
@@ -1120,12 +1201,12 @@ async function playAudioServerFallback(sentence, language){
       body: JSON.stringify({sentence, language})
     });
     if(res.headers.get('X-Audio-Fallback') === 'silent'){
-      speakNativeFallback(sentence, language);
+      speakNativeFallback(sentence, language, finish);
       return;
     }
     const blob = await res.blob();
     if(blob.size < 500){
-      speakNativeFallback(sentence, language);
+      speakNativeFallback(sentence, language, finish);
       return;
     }
 
@@ -1134,10 +1215,11 @@ async function playAudioServerFallback(sentence, language){
     }
     const url = URL.createObjectURL(blob);
     activeAudio = new Audio(url);
-    activeAudio.onended = () => { URL.revokeObjectURL(url); };
-    activeAudio.play().catch(() => { speakNativeFallback(sentence, language); });
+    activeAudio.onended = () => { URL.revokeObjectURL(url); finish(); };
+    activeAudio.onerror = () => { URL.revokeObjectURL(url); finish(); };
+    activeAudio.play().catch(() => { speakNativeFallback(sentence, language, finish); });
   }catch(e){
-    speakNativeFallback(sentence, language);
+    speakNativeFallback(sentence, language, finish);
   }
 }
 

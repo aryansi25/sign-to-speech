@@ -7,6 +7,7 @@ __pycache__/
 *.log
 *.npz
 dataset/
+feedback_dataset/
 *.keras
 labels.npy
 old_*.py

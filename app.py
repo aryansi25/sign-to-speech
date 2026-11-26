@@ -87,11 +87,12 @@ except Exception as e:
 # ULTRA-FAST CONVERSATIONAL ACCURACY & SPEED SETTINGS
 # =========================
 
-HOLD_FRAMES = 2              # 2 consecutive frames (~60ms) eliminates single-frame transit noise
-CONF_THRESHOLD = 0.50        # Precision threshold preventing transition noise from committing
-FAST_COMMIT_THRESHOLD = 0.70 # Fast lock-in when confidence is established
-WORD_COMMIT_COOLDOWN = 0.60  # Minimum 0.60s between distinct words to match natural conversational pace
-SAME_SIGN_COOLDOWN = 1.30    # Minimum 1.30s before repeating the exact same word
+HOLD_FRAMES = 3              # 3 consistent frames eliminates random transit/flicker noise
+CONF_THRESHOLD = 0.62        # Precision threshold rejecting ambiguous/random hand movements
+FAST_COMMIT_THRESHOLD = 0.85 # Fast 2-frame lock-in when confidence is very high
+TRANSIT_VELOCITY_LIMIT = 0.045 # Reject wild/fast random hand movement during transitions
+WORD_COMMIT_COOLDOWN = 1.00  # 1.00s between distinct words: detect one gesture at a time, then speak
+SAME_SIGN_COOLDOWN = 1.60    # 1.60s before repeating the exact same word (max 2 times)
 
 state_lock = threading.Lock()
 seq_lock = threading.Lock()
@@ -115,13 +116,21 @@ worker_running = True
 # =========================
 
 cap = None
+camera_lock = threading.Lock()
+camera_stream_id = 0
 current_sign = None
 confidence = 0
 hold_counter = 0
 
 last_added_sign = None
+consecutive_repeat_count = 0
+MAX_CONSECUTIVE_REPEATS = 2
 latest_event_id = 0
 latest_word_event = None
+last_committed_sequence = None
+last_committed_sign = None
+feedback_lock = threading.Lock()
+FEEDBACK_DIR = "feedback_dataset"
 conversation_history = []  # List of {id, sign, time}
 active_sign_lang = "ISL"
 hands_in_frame = False
@@ -136,13 +145,13 @@ audio_cache = {}  # In-memory RAM cache for 0ms conversational audio streaming
 mp_hands = mp.solutions.hands
 mp_face = mp.solutions.face_detection
 
-# model_complexity=1 gives much sharper finger-curl & bunched-hand landmark accuracy
+# model_complexity=0 gives zero-lag 30 FPS tracking on CPU while keeping 21-point accuracy
 hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=2,
-    model_complexity=1,
-    min_detection_confidence=0.45,
-    min_tracking_confidence=0.45
+    model_complexity=0,
+    min_detection_confidence=0.55,
+    min_tracking_confidence=0.55
 )
 
 # model_selection=1 (full-range 0-5m) detects faces reliably at any webcam distance
@@ -221,19 +230,23 @@ def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
     def dist(i, j):
         return np.linalg.norm(np.array(primary[i][:2]) - np.array(primary[j][:2]))
 
-    d_thumb_idx = dist(4, 8)
-    d_idx_mid   = dist(8, 12)
-    d_thumb_mid = dist(4, 12)
+    # Normalize intra-hand distances by palm_span (wrist -> middle MCP) for camera-distance invariance
+    raw_palm_span = dist(0, 9)
+    palm_span = raw_palm_span if raw_palm_span >= 0.02 else 0.14
+
+    d_thumb_idx = dist(4, 8) / palm_span
+    d_idx_mid   = dist(8, 12) / palm_span
+    d_thumb_mid = dist(4, 12) / palm_span
 
     is_moving = velocity > 0.013
     is_static = velocity < 0.007
     two_hands = len(hand_lms_list) >= 2
 
-    # 1. CLOSED FIST (YES)
+    # 1. CLOSED FIST (YES / SORRY)
     is_fist = curl_idx and curl_mid and curl_ring and curl_pinky
 
     # 2. BUNCHED FINGERTIPS (FOOD)
-    tips_clustered = (d_thumb_idx < 0.09 and d_idx_mid < 0.08 and d_thumb_mid < 0.10)
+    tips_clustered = (d_thumb_idx < 0.65 and d_idx_mid < 0.55 and d_thumb_mid < 0.72)
     is_bunched = (not is_fist) and tips_clustered and (num_ext >= 1 or num_curl <= 2)
 
     # 3. 'W' POSE (WATER)
@@ -249,11 +262,11 @@ def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
     # 5. OK CIRCLE (OKAY / INDIAN)
     is_ok_circle = (
         (not is_fist) and (not is_bunched)
-        and d_thumb_idx < 0.055
+        and d_thumb_idx < 0.45
         and (ext_mid or ext_ring or ext_pinky)
     )
 
-    # 6. POINTING (I / UNDERSTAND / WHERE)
+    # 6. POINTING (I / UNDERSTAND / YOU / WHERE)
     is_pointing = (
         (not is_fist) and (not is_bunched) and (not is_w_pose)
         and (not is_ok_circle) and (not is_ily)
@@ -264,20 +277,28 @@ def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
     is_open_palm = (
         (not is_fist) and (not is_bunched) and (not is_w_pose)
         and (not is_ok_circle) and (not is_pointing) and (not is_ily)
-        and num_ext >= 3 and d_thumb_idx > 0.065
+        and num_ext >= 3 and d_thumb_idx > 0.45
     )
 
-    # Facial / body zone estimation (using fingertip top hand_min_y for clean zone separation)
+    # Facial / body zone estimation (temple vs mouth/chin vs chest)
     hand_min_y = min(pt[1] for pt in primary)
+    hand_center_x = primary[9][0]
+    hand_center_y = primary[9][1]
 
     if face_info is not None:
         chin_y = face_info.get('chin_y', 0.65)
-        nose_y = face_info.get('nose', (0.5, 0.40))[1]
-        face_h = face_info.get('bbox', (0, 0, 0, 0.22))[3]
-        in_temple_zone = hand_min_y <= (nose_y + face_h * 0.10)
-        in_chest_zone  = hand_min_y >  (chin_y + face_h * 0.05)
+        nose_x, nose_y = face_info.get('nose', (0.5, 0.40))
+        face_w = face_info.get('bbox', (0, 0, 0.20, 0.22))[2]
+        face_h = face_info.get('bbox', (0, 0, 0.20, 0.22))[3]
+        in_temple_zone = (
+            hand_min_y <= (nose_y + face_h * 0.08)
+            and (hand_center_y <= (nose_y + face_h * 0.20) or abs(hand_center_x - nose_x) > max(face_w, 0.12) * 0.55)
+        )
+        in_mouth_zone = (not in_temple_zone) and (hand_center_y <= (chin_y + face_h * 0.25))
+        in_chest_zone = hand_center_y > (chin_y + face_h * 0.18)
     else:
         in_temple_zone = hand_min_y < 0.26
+        in_mouth_zone  = (not in_temple_zone) and (hand_min_y <= 0.46)
         in_chest_zone  = hand_min_y > 0.46
 
     top_idx = int(np.argmax(p))
@@ -331,14 +352,26 @@ def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
             "is_open": n_ext >= 3 and h_dist(4, 8) > 0.065,
         }
 
+    # ── Hand & Finger Alignment Vectors (from 21 hand keypoints) ──────────────
+    hand_dx = primary[9][0] - primary[0][0]
+    hand_dy = primary[9][1] - primary[0][1]
+    is_hand_horizontal  = abs(hand_dx) > abs(hand_dy) * 1.15 and abs(hand_dx) > 0.02
+    is_hand_vertical_up = hand_dy < -0.02 and abs(hand_dy) >= abs(hand_dx)
+
+    idx_dx = primary[8][0] - primary[5][0]
+    idx_dy = primary[8][1] - primary[5][1]
+    idx_dz = primary[8][2] - primary[5][2]
+    is_idx_horizontal = abs(idx_dx) > abs(idx_dy) * 1.15 and abs(idx_dx) > 0.02
+    is_idx_up         = idx_dy < -0.03 and abs(idx_dy) >= abs(idx_dx)
+
     # Additional single-hand poses (BATHROOM, NO, YOU)
     # BATHROOM: closed fist with thumb sticking clearly outward (away from index PIP)
-    is_bathroom_thumb = is_fist and ext_thumb and dist(4, 6) > 0.09 and dist(4, 17) > dist(3, 17) * 1.15
+    is_bathroom_thumb = is_fist and ext_thumb and (dist(4, 6) / palm_span) > 0.65 and dist(4, 17) > dist(3, 17) * 1.15
     # NO: index + middle extended together, ring + pinky curled
     is_two_fingers = (not is_fist) and (not is_bunched) and ext_idx and ext_mid and curl_ring and curl_pinky
     # YOU: pointing straight forward at camera (foreshortened 2D index & tip z closer than MCP z)
     is_pointing_forward = is_pointing and (
-        (primary[8][2] < primary[5][2] - 0.045 and dist(5, 8) < 0.095) or top_label == 'YOU'
+        (idx_dz < -0.035 and (np.hypot(idx_dx, idx_dy) / palm_span) < 0.72) or top_label == 'YOU'
     )
 
     # ── TWO-HAND SIGNS (ALL 2-HAND ISL POSTER SIGNS) ─────────────────────────
@@ -410,55 +443,57 @@ def disambiguate_prediction(preds, hand_lms_list, face_info=None, velocity=0.0):
                 if wrist_dist > 0.30 and is_static:
                     boost('WELCOME', factor=7.0, suppress=['HELLO', 'MY', 'THANK_YOU'])
                     two_hand_matched = True
-                elif is_moving and should_disambiguate({'WHAT', 'WELCOME', 'WANT', 'WHERE', 'HELLO'}):
+                elif is_moving:
                     boost('WHAT', factor=7.0, suppress=['HELLO', 'WELCOME', 'WANT', 'WHERE'])
                     two_hand_matched = True
-                elif is_static and palm_dist < 0.24 and should_disambiguate({'NICE', 'TO_MEET', 'WELCOME', 'PLEASE'}):
+                elif palm_dist < 0.24:
                     boost('NICE', factor=6.0, suppress=['HELLO', 'MY', 'THANK_YOU'])
                     two_hand_matched = True
 
     # ── SINGLE-HAND DISAMBIGUATION (when no 2-hand pose already matched) ──────
     if not two_hand_matched:
-        if is_bunched and should_disambiguate({'FOOD', 'THANK_YOU', 'WATER', 'YES', 'I'}):
+        if is_bunched:
             boost('FOOD', factor=9.0, suppress=['THANK_YOU', 'YES', 'I', 'MY', 'HELLO', 'WANT', 'WATER'])
-        elif is_w_pose and should_disambiguate({'WATER', 'FOOD', 'THANK_YOU', 'YES', 'HELLO'}):
+        elif is_w_pose:
             boost('WATER', factor=9.0, suppress=['FOOD', 'THANK_YOU', 'YES', 'HELLO', 'WANT'])
         elif is_ily:
             boost('I_LOVE_YOU', factor=8.0, suppress=['I', 'YES', 'HELLO', 'WHAT', 'WANT'])
-        elif is_bathroom_thumb and should_disambiguate({'BATHROOM'}):
+        elif is_bathroom_thumb:
             boost('BATHROOM', factor=8.0, suppress=['YES', 'SORRY', 'I', 'MY'])
-        elif is_two_fingers and should_disambiguate({'NO', 'NAME_IS', 'WATER', 'I', 'YES'}):
-            boost('NO', factor=7.0, suppress=['YES', 'I', 'WATER'])
-        elif is_pointing and should_disambiguate({'I', 'YOU', 'UNDERSTAND', 'YES', 'HELLO', 'MY'}):
+        elif is_two_fingers:
+            boost('NO', factor=8.0, suppress=['YES', 'I', 'WATER'])
+        elif is_pointing:
             if in_temple_zone:
                 boost('UNDERSTAND', factor=9.0, suppress=['HELLO', 'I', 'YOU', 'YES', 'MY', 'WHERE'])
             elif is_pointing_forward:
                 boost('YOU', factor=8.0, suppress=['I', 'YES', 'UNDERSTAND', 'MY'])
             else:
                 boost('I', factor=9.0, suppress=['YES', 'YOU', 'UNDERSTAND', 'MY', 'FOOD', 'WANT', 'WHERE'])
-        elif is_fist and should_disambiguate({'YES', 'SORRY', 'I', 'FOOD', 'THANK_YOU', 'MY'}):
-            if in_chest_zone and top_label == 'SORRY':
+        elif is_fist:
+            if in_chest_zone and (is_hand_horizontal or is_moving or top_label == 'SORRY'):
                 boost('SORRY', factor=8.0, suppress=['YES', 'I', 'MY'])
             else:
                 boost('YES', factor=9.0, suppress=['I', 'FOOD', 'THANK_YOU', 'MY', 'WANT', 'WHAT'])
-        elif is_open_palm and should_disambiguate({'HELLO', 'UNDERSTAND', 'MY', 'WANT', 'THANK_YOU', 'FOOD', 'PLEASE'}):
-            if in_temple_zone:
+        elif is_open_palm:
+            if in_temple_zone and not is_hand_horizontal:
                 boost('HELLO', factor=9.0, suppress=['UNDERSTAND', 'MY', 'THANK_YOU', 'WANT', 'WHAT'])
-            elif in_chest_zone:
+            elif in_mouth_zone and not in_chest_zone:
+                boost('THANK_YOU', factor=8.0, suppress=['FOOD', 'MY', 'HELLO', 'WANT', 'YES'])
+            elif in_chest_zone and top_label != 'THANK_YOU':
                 if top_label == 'PLEASE':
                     boost('PLEASE', factor=7.0, suppress=['MY', 'THANK_YOU', 'HELLO'])
-                elif is_moving:
+                elif is_moving and not is_hand_horizontal:
                     boost('WANT', factor=8.0, suppress=['MY', 'THANK_YOU', 'I', 'HELLO', 'FOOD'])
                 else:
                     boost('MY', factor=9.0, suppress=['I', 'THANK_YOU', 'FOOD', 'HELLO', 'WANT'])
             else:
                 boost('THANK_YOU', factor=8.0, suppress=['FOOD', 'MY', 'HELLO', 'WANT', 'YES'])
-        elif is_ok_circle and should_disambiguate({'OKAY', 'INDIAN'}):
+        elif is_ok_circle:
             ok_i  = LABEL_TO_IDX.get('OKAY', -1)
             ind_i = LABEL_TO_IDX.get('INDIAN', -1)
             if ok_i >= 0 and ind_i >= 0:
-                winner = 'INDIAN' if (in_chest_zone or p[ind_i] > p[ok_i]) else 'OKAY'
-                boost(winner, factor=6.0)
+                winner = 'INDIAN' if (in_chest_zone or in_mouth_zone or p[ind_i] > p[ok_i]) else 'OKAY'
+                boost(winner, factor=8.0, suppress=['HELLO', 'YES', 'I'])
 
     # Normalize distribution
     s = np.sum(p)
@@ -578,7 +613,8 @@ def inference_worker():
     to eliminate frame noise and guarantee high recognition accuracy.
     """
     global current_sign, confidence, hold_counter, hands_in_frame
-    global last_added_sign, latest_event_id, latest_word_event, latest_sequence_snapshot, last_sign_commit_time
+    global last_added_sign, consecutive_repeat_count, latest_event_id, latest_word_event
+    global last_committed_sequence, last_committed_sign, latest_sequence_snapshot, last_sign_commit_time
 
     while worker_running:
         signaled = new_sample_ready.wait(timeout=0.04)
@@ -631,32 +667,45 @@ def inference_worker():
 
                 now = time.time()
 
-                # REAL-TIME INSTANT FEEDBACK:
-                # Prioritize high-confidence raw or smoothed sign for instant reaction
-                active_sign = stable_label if (stable_label in VALID_SIGNS_SET and conf >= CONF_THRESHOLD) else (
-                    raw_label if (raw_label in VALID_SIGNS_SET and raw_conf >= CONF_THRESHOLD) else None
+                # Reject wild/random hand movement & require smoothed + instantaneous agreement
+                is_random_motion = velocity > TRANSIT_VELOCITY_LIMIT
+                signs_agree = (stable_label == raw_label)
+                active_sign = (
+                    stable_label
+                    if (not is_random_motion and signs_agree and stable_label in VALID_SIGNS_SET and conf >= CONF_THRESHOLD)
+                    else None
                 )
-                active_conf = conf if active_sign == stable_label else raw_conf
+                active_conf = conf if active_sign else 0.0
 
                 if active_sign:
                     current_sign = active_sign
                     confidence = round(active_conf * 100, 1)
 
-                    # Dynamic hold: 2 frames (~50ms) eliminates transit noise; 1 frame if >= FAST_COMMIT_THRESHOLD
-                    required_hold = 1 if active_conf >= FAST_COMMIT_THRESHOLD else HOLD_FRAMES
+                    # Require at least 2 frames even at >= 85% confidence to block 1-frame random noise
+                    required_hold = 2 if active_conf >= FAST_COMMIT_THRESHOLD else HOLD_FRAMES
 
-                    # Conversational pacing: 0.60s cooldown between distinct signs, 1.20s for repeating same sign
+                    # One word at a time: allow distinct signs after WORD_COMMIT_COOLDOWN,
+                    # and cap identical consecutive repeats at MAX_CONSECUTIVE_REPEATS (2)
                     time_since_commit = now - last_sign_commit_time
                     if active_sign != last_added_sign:
                         can_commit = (time_since_commit >= WORD_COMMIT_COOLDOWN)
                     else:
-                        can_commit = (time_since_commit >= SAME_SIGN_COOLDOWN)
+                        can_commit = (
+                            consecutive_repeat_count < MAX_CONSECUTIVE_REPEATS
+                            and time_since_commit >= SAME_SIGN_COOLDOWN
+                        )
 
                     hold_counter += 1
                     if hold_counter >= required_hold and can_commit:
                         latest_event_id += 1
                         latest_word_event = active_sign
+                        if active_sign == last_added_sign:
+                            consecutive_repeat_count += 1
+                        else:
+                            consecutive_repeat_count = 1
                         last_added_sign = active_sign
+                        last_committed_sign = active_sign
+                        last_committed_sequence = np.copy(input_data[0])
                         last_sign_commit_time = now
                         conversation_history.append({
                             "id": latest_event_id,
@@ -673,8 +722,6 @@ def inference_worker():
                         if conf < 0.30:
                             current_sign = None
                             confidence = 0
-                        if now - last_sign_commit_time > 1.2:
-                            last_added_sign = None
 
         except Exception as e:
             print(f"Async inference error: {e}")
@@ -723,39 +770,56 @@ def translate_text(text, target_lang):
 # =========================
 
 def generate_frames():
-    global cap, current_sign, confidence, hold_counter, hands_in_frame
-    global last_added_sign, latest_event_id, latest_word_event, latest_sequence_snapshot, missing_hand_frames
+    global cap, camera_stream_id, current_sign, confidence, hold_counter, hands_in_frame
+    global last_added_sign, consecutive_repeat_count, latest_event_id, latest_word_event, latest_sequence_snapshot, missing_hand_frames
 
-    # Open webcam with standard backend for instant sub-second startup
-    cap = cv2.VideoCapture(0)
+    with camera_lock:
+        camera_stream_id += 1
+        my_stream_id = camera_stream_id
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            cap = None
 
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        my_cap = cv2.VideoCapture(0)
+        my_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        my_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        my_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap = my_cap
 
     frame_counter = 0
+    failed_reads = 0
     cached_face_info = None
     face_cache_age = 0
 
     try:
-        while True:
-            success, frame = cap.read()
+        while my_stream_id == camera_stream_id:
+            success, frame = my_cap.read()
             if not success or frame is None:
-                break
+                failed_reads += 1
+                if failed_reads > 15:
+                    break
+                time.sleep(0.03)
+                continue
+            failed_reads = 0
 
-            # Mirror view for natural interaction (display frame stays untouched)
+            # Mirror view for natural interaction (display frame stays crisp 640x480)
             frame = cv2.flip(frame, 1)
+            frame_counter += 1
 
-            # Enhance luminance with CLAHE for MediaPipe detection only
-            ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+            # Downscale + CLAHE for faster, smoother MediaPipe detection
+            det_bgr = cv2.resize(frame, (480, 360), interpolation=cv2.INTER_LINEAR)
+            ycrcb = cv2.cvtColor(det_bgr, cv2.COLOR_BGR2YCrCb)
             ycrcb[:, :, 0] = _clahe.apply(ycrcb[:, :, 0])
             enhanced_bgr = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
             rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
             results = hands.process(rgb)
 
-            # Full-range face detection with 15-frame occlusion cache (keeps zones stable when hand covers mouth)
-            face_results = face_detector.process(rgb)
+            # Face detection every 4th frame (or when cache empty) with 15-frame occlusion cache
             face_info = None
+            face_results = face_detector.process(rgb) if (cached_face_info is None or frame_counter % 4 == 0) else None
             if face_results and face_results.detections:
                 # Pick primary signer's face (largest bounding box) to ignore background faces
                 det = max(
@@ -806,6 +870,7 @@ def generate_frames():
                         current_sign = None
                         confidence = 0
                         last_added_sign = None
+                        consecutive_repeat_count = 0
 
                     with seq_lock:
                         sequence.clear()
@@ -864,11 +929,13 @@ def generate_frames():
     except Exception as e:
         print(f"Video stream error: {e}")
     finally:
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                pass
+        with camera_lock:
+            if cap is my_cap:
+                try:
+                    my_cap.release()
+                except Exception:
+                    pass
+                cap = None
 
 # =========================
 # ROUTES
@@ -942,10 +1009,11 @@ def get_state():
 
 @app.route("/api/clear_conversation", methods=["POST"])
 def clear_conversation():
-    global last_added_sign, latest_event_id, latest_word_event
+    global last_added_sign, consecutive_repeat_count, latest_event_id, latest_word_event
     with state_lock:
         conversation_history.clear()
         last_added_sign = None
+        consecutive_repeat_count = 0
         latest_word_event = None
     return jsonify({"status": "cleared"})
 
@@ -960,12 +1028,13 @@ def set_sign_language():
 
 @app.route("/api/stop_camera", methods=["POST"])
 def stop_camera():
-    global cap, hold_counter, current_sign, last_added_sign, hands_in_frame
+    global cap, camera_stream_id, hold_counter, current_sign, last_added_sign, consecutive_repeat_count, hands_in_frame
     global latest_sequence_snapshot, latest_hand_lms_snapshot, latest_face_info_snapshot, latest_hand_velocity_snapshot
     with state_lock:
         hold_counter = 0
         current_sign = None
         last_added_sign = None
+        consecutive_repeat_count = 0
         hands_in_frame = False
 
     with seq_lock:
@@ -977,12 +1046,127 @@ def stop_camera():
         latest_face_info_snapshot = None
         latest_hand_velocity_snapshot = 0.0
 
-    if cap is not None:
-        try:
-            cap.release()
-        except Exception:
-            pass
+    with camera_lock:
+        camera_stream_id += 1
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            cap = None
     return jsonify({"status": "stopped"})
+
+# =========================
+# LIVE FEEDBACK & ONLINE MODEL TRAINING
+# =========================
+
+def _count_feedback_samples():
+    if not os.path.exists(FEEDBACK_DIR):
+        return 0, {}
+    counts = {}
+    total = 0
+    for cls in os.listdir(FEEDBACK_DIR):
+        cdir = os.path.join(FEEDBACK_DIR, cls)
+        if os.path.isdir(cdir):
+            n = len([f for f in os.listdir(cdir) if f.endswith(".npy")])
+            if n > 0:
+                counts[cls] = n
+                total += n
+    return total, counts
+
+
+def _train_feedback_async():
+    """
+    Fine-tunes the LSTM in the background using user-confirmed feedback sequences
+    combined with 1 anchor sequence per sign from BENCHMARK_DATA to prevent forgetting.
+    """
+    global model
+    with feedback_lock:
+        try:
+            X_fb, y_fb = [], []
+            if os.path.exists(FEEDBACK_DIR):
+                for cls in os.listdir(FEEDBACK_DIR):
+                    if cls not in LABEL_TO_IDX:
+                        continue
+                    cdir = os.path.join(FEEDBACK_DIR, cls)
+                    if not os.path.isdir(cdir):
+                        continue
+                    files = sorted(
+                        [f for f in os.listdir(cdir) if f.endswith(".npy")],
+                        reverse=True
+                    )[:15]
+                    for f in files:
+                        arr = np.load(os.path.join(cdir, f))
+                        if arr.shape == (20, 126):
+                            # Weight user-confirmed samples 2x
+                            X_fb.extend([arr, arr])
+                            y_fb.extend([LABEL_TO_IDX[cls], LABEL_TO_IDX[cls]])
+
+            if not X_fb:
+                return
+
+            # Add 1 replay anchor per class from BENCHMARK_DATA to preserve all 27 signs
+            for sign, seq in BENCHMARK_DATA.items():
+                if sign in LABEL_TO_IDX and seq.shape == (20, 126):
+                    X_fb.append(seq)
+                    y_fb.append(LABEL_TO_IDX[sign])
+
+            X_arr = np.array(X_fb, dtype=np.float32)
+            y_arr = tf.keras.utils.to_categorical(y_fb, num_classes=len(labels))
+
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=3e-4),
+                loss="categorical_crossentropy",
+                metrics=["accuracy"],
+            )
+            model.fit(X_arr, y_arr, epochs=4, batch_size=16, shuffle=True, verbose=0)
+            model.save("isl_lstm_model.keras")
+            _ = _fast_infer(tf.zeros((1, 20, 126), dtype=tf.float32))
+            print(f"[Feedback Train] Model updated with {len(X_arr)} replay-anchored samples.")
+        except Exception as e:
+            print(f"[Feedback Train] Error: {e}")
+
+
+@app.route("/api/feedback_correct", methods=["POST"])
+def api_feedback_correct():
+    data = request.get_json(silent=True) or {}
+    req_word = data.get("word", "").strip().upper().replace(" ", "_")
+
+    with state_lock:
+        target_word = req_word if req_word in VALID_SIGNS_SET else (last_committed_sign or current_sign)
+        seq_copy = np.copy(last_committed_sequence) if last_committed_sequence is not None else None
+
+    if seq_copy is None:
+        with seq_lock:
+            if latest_sequence_snapshot is not None:
+                seq_copy = np.copy(latest_sequence_snapshot[0])
+
+    if not target_word or target_word not in VALID_SIGNS_SET:
+        return jsonify({"error": "No valid detected word to confirm"}), 400
+    if seq_copy is None or seq_copy.shape != (20, 126):
+        return jsonify({"error": "No gesture sequence captured yet"}), 400
+
+    save_dir = os.path.join(FEEDBACK_DIR, target_word)
+    os.makedirs(save_dir, exist_ok=True)
+    fname = f"{int(time.time() * 1000)}.npy"
+    np.save(os.path.join(save_dir, fname), seq_copy)
+
+    total_saved, counts = _count_feedback_samples()
+    threading.Thread(target=_train_feedback_async, daemon=True).start()
+
+    return jsonify({
+        "status": "training_started",
+        "word": target_word,
+        "total_samples": total_saved,
+        "class_samples": counts.get(target_word, 1)
+    })
+
+
+@app.route("/api/feedback_stats")
+def api_feedback_stats():
+    total_saved, counts = _count_feedback_samples()
+    return jsonify({"total_samples": total_saved, "counts": counts})
+
 
 # =========================
 # TRANSLATE & SENTENCE REST API
